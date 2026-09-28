@@ -19,7 +19,7 @@ aegis-gold-mt5/
 - [`docs/LOCKED_STRATEGY_SPEC.md`](docs/LOCKED_STRATEGY_SPEC.md) is the authoritative rulebook.
 - [`MQL5/Experts/AegisGoldTrendPullback.mq5`](MQL5/Experts/AegisGoldTrendPullback.mq5) is the complete EA source.
 
-## Locked defaults (v1.4)
+## Locked defaults (v1.5)
 
 - Trading hours: 24/5. The EA scans every M5 bar, Monday–Friday (server time), while the broker market is open (`InpSessionMode=SESSION_24X5`).
 - Market-close protection: no new entries in the last 15 min of each daily session or the last 60 min before the weekly close; the EA's pending orders are cancelled in those windows. Set `InpNoEntryMinutesBeforeDailyClose` / `InpNoEntryMinutesBeforeWeeklyClose` to 0 to disable.
@@ -29,9 +29,10 @@ aegis-gold-mt5/
 - Two-tier pullback (Tier 2 checked first):
   - Tier 2 (deep): exhaustion candle touches the outer band with RSI(2) ≤ 15 (≥ 85 for shorts); confirmation closes back inside the band.
   - Tier 1 (shallow): exhaustion candle touches the EMA20 basis with RSI(2) ≤ 35 (≥ 65 for shorts); confirmation closes back on the trend side of EMA20.
+- Tier 0 momentum (M15 trend only): exhaustion candle taps M5 EMA9 but stays beyond EMA20 with RSI(2) ≤ 40 (≥ 60 for shorts); confirmation closes in the trend direction, in the favourable half of its range, back beyond EMA9, with EMA9 beyond EMA20 (`InpEnableMomentumEma9`). Experimental; see spec section 0.
 - Range mode (flat M15): when there is no M15 trend and |EMA50 − EMA200| ≤ 1.0 × M15 ATR14, the EA fades a touch of the 1.5 ATR M5 band back toward EMA20, in either direction, with RSI(2) ≤ 10 (≥ 90 for shorts) and the same confirmation, stop, target and filters (`InpEnableRangeMode`).
 - Confirmation (both tiers): the next closed M5 candle is in the trend direction, closes in the favourable half of its range and beyond the exhaustion close, with true range ≤ 1.5 ATR. The exhaustion, confirmation and current bars must be consecutive (no setup across a market break).
-- Entry: stop order $0.05 beyond the confirmation candle; expires after three M5 bars. The order comment records setup type and UTC session, e.g. `AegisGold-v1.4-T1-ASIA` or `AegisGold-v1.4-R-LON`, plus `-P2` for an additional position and `-C` for an entry made after a cooldown the same day.
+- Entry: stop order $0.05 beyond the confirmation candle; expires after three M5 bars. The order comment records setup type and UTC session, e.g. `AegisGold-v1.5-T1-ASIA`, `AegisGold-v1.5-T0-NY` or `AegisGold-v1.5-R-LON`, plus `-P2` for an additional position and `-C` for an entry made after a cooldown the same day.
 - Volume: fixed 0.02 lot.
 - SL: beyond the recent M5 swing and both signal candles, plus a 0.15 ATR buffer; minimum $4; maximum `clamp(1.5 × M15 ATR14, $5, $7)`; setup rejected if structure needs more.
 - TP: `clamp(1.4 × SL distance, $6.00, $9.80)`, i.e. 1.4R across the $4.29–$7.00 stop range.
@@ -41,7 +42,7 @@ aegis-gold-mt5/
 - Spread filter: skip when the spread is above $0.60 (v1.3: $0.30). Each $0.10 of spread costs about £0.15 per 0.02-lot trade.
 - News, volatility-shock, runaway-trend and margin filters are unchanged.
 - No martingale, grid, averaging, recovery sizing or trailing stop.
-- Magic number 26092814 keeps v1.4 statistics separate from earlier versions.
+- Magic number 26092815 keeps v1.5 statistics separate from earlier versions.
 
 Section 0 of the spec has the change log, the input sets that reproduce earlier versions, and the replica evidence for each v1.3 change.
 
@@ -126,10 +127,10 @@ Four to five trades per day is a target, not a guarantee. The EA accepts no more
 When a test finishes (or the EA is removed from a chart), the journal prints:
 
 ```text
-AegisGold setup funnel: N qualified setups (T1 a, T2 b, range r), orders placed c (d as an additional position). Blocked by: daily halt ..., cooldown ..., open position/order ..., session ..., market close ..., spread ..., shock ..., runaway ..., news ..., chase ..., no swing ..., stop too wide ..., worst-case daily loss ..., margin ..., other ...
+AegisGold setup funnel: N qualified setups (T1 a, T2 b, range r), orders placed c (d as an additional position); the setup counts are listed as T0, T1, T2, range. Blocked by: daily halt ..., cooldown ..., open position/order ..., session ..., market close ..., spread ..., shock ..., runaway ..., news ..., chase ..., no swing ..., stop too wide ..., worst-case daily loss ..., margin ..., other ...
 AegisGold position management: cooldowns, weekly-close exits, stale-trade closes, breakeven moves
-AegisGold results this run (magic 26092814): trades, wins, net, trades/day
-AegisGold   Tier 1: ... / Tier 2: ... / Range: ...
+AegisGold results this run (magic 26092815): trades, wins, net, trades/day
+AegisGold   Tier 1: ... / Tier 2: ... / Range: ... / Tier 0: ...
 AegisGold   ASIA / LON / NY / LATE: ...
 AegisGold   Entered after a cooldown the same day: ...
 AegisGold   Additional positions: ...

@@ -1,6 +1,19 @@
-# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.4
+# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.5
 
 ## 0. Change log
+
+### v1.5 (from v1.4)
+
+| Area | v1.4 | v1.5 default |
+|---|---|---|
+| Tier 0 momentum setup | — | In an M15 trend, a shallow pullback that taps M5 EMA9 but holds beyond EMA20 (`InpEnableMomentumEma9`); see 4.1b |
+| Reporting | T1, T2, Range | Adds Tier 0 to the funnel and results; order comment tag `T0` |
+| Magic number | 26092814 | 26092815 |
+
+v1.4 behaviour: `InpEnableMomentumEma9=false`.
+
+Evidence: the user's Pepperstone runs show Tier 0 trades +£70.76 over 13 (Jun–Sep) and +£8.82 over 4 (Mar–Jun), but the Jun–Sep total rose only £46.69, so the existing setups lost about £24 to it. In the replica, Tier 0 fired far more often (94 and 77 trades) at a 35–38% win rate and lost £54 and £92; the displaced setups' results changed by +£33 and −£42. Adding "confirmation close beyond the exhaustion close" to Tier 0 changed nothing in the replica. The Pepperstone and replica results disagree on both frequency and sign, so Tier 0 remains an experiment.
+
 
 ### v1.4 (from v1.3)
 
@@ -102,7 +115,7 @@ In the v1.2 replica, the daily loss breaker blocked the most setups (151), follo
 
 ## 1. Status and calibration boundary
 
-This document locks the fifth implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
+This document locks the sixth implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
 
 Pepperstone UK currently advertises Razor XAU/USD spreads from 0.08, GBP commission of £4.50 per lot round-trip, and retail gold leverage of 1:20. At 0.02 lot, the advertised commission implies £0.09 round-trip before spread and slippage. The EA reads the actual MT5 symbol properties at runtime and does not assume a particular number of digits, tick size, contract size, minimum stop level, or margin requirement.
 
@@ -222,6 +235,18 @@ The additional position has its own structural SL and TP, calculated exactly as 
 ### 4.2 Short setup
 
 Exact mirror: M15 short regime; bearish confirmation closing at or below its midpoint and below the exhaustion close; Tier 2 needs the exhaustion high at or above `EMA20 + 1.2 × ATR20` with RSI(2) ≥ 85 and a confirmation close back below that band; Tier 1 needs the exhaustion high at or above EMA20 with RSI(2) ≥ 65 and a confirmation close back below EMA20. Place a sell-stop at the confirmation low minus $0.05.
+
+### 4.1b Tier 0 momentum setup (M15 trend only)
+
+Long (mirror for shorts):
+
+1. M15 long regime (3.1).
+2. Exhaustion low at or below M5 EMA9 but strictly above EMA20 (`low[2] <= ema9[2]` and `low[2] > ema20[2]`), so it never overlaps Tier 1 or Tier 2.
+3. Exhaustion RSI(2) ≤ 40 (shorts ≥ 60).
+4. Confirmation bullish, closing at or above its midpoint and above EMA9, with EMA9 above EMA20 on the confirmation bar.
+5. Confirmation true range ≤ 1.5 × ATR20 and consecutive bars, as for all setups.
+
+Unlike Tier 1/2, the confirmation does not have to close beyond the exhaustion close; this follows the user's tested rule. Entry, stop, target, expiry and every filter are the same as for the other setups. Order comment tag: `T0`.
 
 ### 4.2a Range setup (flat M15 regime)
 

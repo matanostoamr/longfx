@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.40"
-#property description "Aegis XAU/USD M15 regime and M5 Keltner-RSI pullback EA with flat-market range mode (v1.4, 24/5)"
+#property version   "1.50"
+#property description "Aegis XAU/USD M15 regime and M5 Keltner-RSI pullback EA with EMA9 momentum tier and range mode (v1.5, 24/5)"
 
 #include <Trade/Trade.mqh>
 
@@ -54,15 +54,17 @@ enum StaleTradeAction
 #define FUNNEL_MARGIN         16
 #define FUNNEL_OTHER          17
 #define FUNNEL_PLACED         18
-#define FUNNEL_SIZE           19
+#define FUNNEL_SIGNAL_T0      19
+#define FUNNEL_SIZE           20
 
-// Setup types (recorded in the order comment as T1, T2 or R)
+// Setup types (recorded in the order comment as T1, T2, R or T0)
 #define SETUP_TIER1           1
 #define SETUP_TIER2           2
 #define SETUP_RANGE           3
+#define SETUP_MOMENTUM        4
 
 input group "Identity and account safety"
-input ulong  InpMagicNumber                  = 26092814;
+input ulong  InpMagicNumber                  = 26092815;
 input bool   InpRequireGBPAccount             = true;
 input double InpFixedLots                     = 0.02;
 input double InpMinimumProjectedMarginLevel   = 120.0;
@@ -89,6 +91,13 @@ input bool   InpEnableTier2                   = true;
 input double InpKeltnerAtrMultiplier          = 1.20;
 input double InpTier2RsiLongThreshold         = 15.0;
 input double InpTier2RsiShortThreshold        = 85.0;
+
+input group "Tier 0: momentum pullback to fast EMA (M15 trend only)"
+// Candle 2 taps the fast EMA but stays beyond EMA20; candle 1 reclaims the fast EMA
+input bool   InpEnableMomentumEma9            = true;
+input int    InpMomentumEmaPeriod             = 9;
+input double InpMomentumRsiLongThreshold      = 40.0;
+input double InpMomentumRsiShortThreshold     = 60.0;
 
 input group "Range mode: flat M15 regime"
 // When the M15 trend filter is off and the EMAs have converged, fade the outer M5 band back toward EMA20
@@ -176,6 +185,7 @@ input int    InpCooldownHoursAfterHalt        = 2;
 input double InpMaximumDailyDrawdown          = 14.0;
 
 int      g_m5EmaHandle       = INVALID_HANDLE;
+int      g_m5FastEmaHandle   = INVALID_HANDLE;
 int      g_m5AtrHandle       = INVALID_HANDLE;
 int      g_m5RsiHandle       = INVALID_HANDLE;
 int      g_m15FastEmaHandle  = INVALID_HANDLE;
@@ -245,13 +255,14 @@ int OnInit()
    }
 
    g_m5EmaHandle      = iMA(_Symbol, PERIOD_M5, InpM5KeltnerEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_m5FastEmaHandle  = iMA(_Symbol, PERIOD_M5, InpMomentumEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    g_m5AtrHandle      = iATR(_Symbol, PERIOD_M5, InpM5AtrPeriod);
    g_m5RsiHandle      = iRSI(_Symbol, PERIOD_M5, InpRsiPeriod, PRICE_CLOSE);
    g_m15FastEmaHandle = iMA(_Symbol, PERIOD_M15, InpM15FastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    g_m15SlowEmaHandle = iMA(_Symbol, PERIOD_M15, InpM15SlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    g_m15AtrHandle     = iATR(_Symbol, PERIOD_M15, InpM15AtrPeriod);
 
-   if(g_m5EmaHandle == INVALID_HANDLE || g_m5AtrHandle == INVALID_HANDLE ||
+   if(g_m5EmaHandle == INVALID_HANDLE || g_m5FastEmaHandle == INVALID_HANDLE || g_m5AtrHandle == INVALID_HANDLE ||
       g_m5RsiHandle == INVALID_HANDLE || g_m15FastEmaHandle == INVALID_HANDLE ||
       g_m15SlowEmaHandle == INVALID_HANDLE || g_m15AtrHandle == INVALID_HANDLE)
    {
@@ -355,6 +366,10 @@ bool InputsAreValid()
       InpKeltnerAtrMultiplier <= 0.0 || InpM15AtrPeriod <= 1)
       valid = false;
    if(!InpEnableTier1 && !InpEnableTier2)
+      valid = false;
+   if(InpMomentumEmaPeriod < 2 || InpMomentumEmaPeriod >= InpM5KeltnerEmaPeriod ||
+      InpMomentumRsiLongThreshold <= 0.0 || InpMomentumRsiLongThreshold >= 50.0 ||
+      InpMomentumRsiShortThreshold <= 50.0 || InpMomentumRsiShortThreshold >= 100.0)
       valid = false;
    if(InpRangeMaxEmaGapAtr <= 0.0 || InpRangeBandAtr <= 0.0 ||
       InpRangeRsiLongThreshold <= 0.0 || InpRangeRsiLongThreshold >= 50.0 ||
@@ -483,26 +498,34 @@ void EvaluateNewM5Bar()
 
    MqlRates rates[];
    double ema[];
+   double ema_fast[];
    double atr[];
    double rsi[];
    double m15_fast[];
    double m15_slow[];
    double m15_atr[];
-   if(!LoadStrategyData(rates, ema, atr, rsi, m15_fast, m15_slow, m15_atr))
+   if(!LoadStrategyData(rates, ema, ema_fast, atr, rsi, m15_fast, m15_slow, m15_atr))
    {
       SetStatus(gate_stage >= 0 ? gate_status : "Waiting for sufficient indicator history");
       return;
    }
 
    int setup = 0;
-   SignalDirection signal = BuildSignal(rates, ema, atr, rsi, m15_fast, m15_slow, m15_atr, setup);
+   SignalDirection signal = BuildSignal(rates, ema, ema_fast, atr, rsi, m15_fast, m15_slow, m15_atr, setup);
    if(signal == SIGNAL_NONE)
    {
       SetStatus(gate_stage >= 0 ? gate_status : "No qualified closed-candle setup");
       return;
    }
 
-   g_funnel[setup == SETUP_TIER1 ? FUNNEL_SIGNAL_T1 : (setup == SETUP_TIER2 ? FUNNEL_SIGNAL_T2 : FUNNEL_SIGNAL_RANGE)]++;
+   if(setup == SETUP_TIER1)
+      g_funnel[FUNNEL_SIGNAL_T1]++;
+   else if(setup == SETUP_TIER2)
+      g_funnel[FUNNEL_SIGNAL_T2]++;
+   else if(setup == SETUP_MOMENTUM)
+      g_funnel[FUNNEL_SIGNAL_T0]++;
+   else
+      g_funnel[FUNNEL_SIGNAL_RANGE]++;
    if(gate_stage >= 0)
    {
       BlockSetup(gate_stage, StringFormat("%s; %s %s setup skipped", gate_status, SetupTag(setup),
@@ -578,7 +601,7 @@ double CurrentMaximumStopPrice(const double &m15_atr[])
 //+------------------------------------------------------------------+
 //| Load closed/current M5 and M15 values                             |
 //+------------------------------------------------------------------+
-bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &rsi[],
+bool LoadStrategyData(MqlRates &rates[], double &ema[], double &ema_fast[], double &atr[], double &rsi[],
                       double &m15_fast[], double &m15_slow[], double &m15_atr[])
 {
    int needed_m5 = InpAtrMedianLookbackBars + InpNormalBarsAfterShock + 10;
@@ -591,13 +614,15 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
 
    ArraySetAsSeries(rates, true);
    ArraySetAsSeries(ema, true);
+   ArraySetAsSeries(ema_fast, true);
    ArraySetAsSeries(atr, true);
    ArraySetAsSeries(rsi, true);
    ArraySetAsSeries(m15_fast, true);
    ArraySetAsSeries(m15_slow, true);
    ArraySetAsSeries(m15_atr, true);
 
-   if(BarsCalculated(g_m5EmaHandle) < needed_m5 || BarsCalculated(g_m5AtrHandle) < needed_m5 ||
+   if(BarsCalculated(g_m5EmaHandle) < needed_m5 || BarsCalculated(g_m5FastEmaHandle) < needed_m5 ||
+      BarsCalculated(g_m5AtrHandle) < needed_m5 ||
       BarsCalculated(g_m5RsiHandle) < needed_m5 || BarsCalculated(g_m15FastEmaHandle) < needed_m15 ||
       BarsCalculated(g_m15SlowEmaHandle) < needed_m15 || BarsCalculated(g_m15AtrHandle) < needed_m15)
       return false;
@@ -605,6 +630,8 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
    if(CopyRates(_Symbol, PERIOD_M5, 0, needed_m5, rates) != needed_m5)
       return false;
    if(CopyBuffer(g_m5EmaHandle, 0, 0, needed_m5, ema) != needed_m5)
+      return false;
+   if(CopyBuffer(g_m5FastEmaHandle, 0, 0, needed_m5, ema_fast) != needed_m5)
       return false;
    if(CopyBuffer(g_m5AtrHandle, 0, 0, needed_m5, atr) != needed_m5)
       return false;
@@ -628,6 +655,9 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
 //|   Tier 1 (shallow): exhaustion bar reaches the EMA20 basis with  |
 //|                  RSI(2) <= 35 / >= 65, and confirmation reclaims |
 //|                  the basis. Tier 2 is checked first.             |
+//|   Tier 0 (momentum): exhaustion bar taps EMA9 but stays beyond   |
+//|                  EMA20, RSI(2) <= 40 / >= 60; confirmation closes|
+//|                  back beyond EMA9 with EMA9 beyond EMA20.        |
 //| M15 flat (no trend and |EMA50 - EMA200| <= 1.0 x M15 ATR14),     |
 //| either direction:                                                |
 //|   Range: exhaustion bar reaches the 1.5 ATR band with RSI(2)     |
@@ -635,7 +665,7 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
 //| The exhaustion bar, confirmation bar and current bar must be     |
 //| consecutive M5 bars, so no setup spans a market break.           |
 //+------------------------------------------------------------------+
-SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const double &atr[],
+SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const double &ema_fast[], const double &atr[],
                             const double &rsi[], const double &m15_fast[], const double &m15_slow[],
                             const double &m15_atr[], int &setup)
 {
@@ -714,6 +744,25 @@ SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const 
       }
    }
 
+   // Tier 0: shallow momentum pullback that holds above (below) EMA20, so it never overlaps Tier 1/2.
+   // Its confirmation is as specified: direction, close location and a fast-EMA reclaim.
+   if(InpEnableMomentumEma9 && long_regime &&
+      rates[2].low <= ema_fast[2] && rates[2].low > ema[2] && rsi[2] <= InpMomentumRsiLongThreshold &&
+      rates[1].close > rates[1].open && rates[1].close >= confirmation_midpoint &&
+      rates[1].close > ema_fast[1] && ema_fast[1] > ema[1])
+   {
+      setup = SETUP_MOMENTUM;
+      return SIGNAL_LONG;
+   }
+   if(InpEnableMomentumEma9 && short_regime &&
+      rates[2].high >= ema_fast[2] && rates[2].high < ema[2] && rsi[2] >= InpMomentumRsiShortThreshold &&
+      rates[1].close < rates[1].open && rates[1].close <= confirmation_midpoint &&
+      rates[1].close < ema_fast[1] && ema_fast[1] < ema[1])
+   {
+      setup = SETUP_MOMENTUM;
+      return SIGNAL_SHORT;
+   }
+
    if(short_regime && short_confirm)
    {
       if(InpEnableTier2)
@@ -749,6 +798,8 @@ string SetupTag(const int setup)
       return "T2";
    if(setup == SETUP_RANGE)
       return "R";
+   if(setup == SETUP_MOMENTUM)
+      return "T0";
    return "?";
 }
 
@@ -901,8 +952,8 @@ int PlaceProtectedPendingOrder(const SignalDirection signal, const int setup, co
       expiration = iTime(_Symbol, PERIOD_M5, 0) + InpPendingExpiryBars * PeriodSeconds(PERIOD_M5);
    }
 
-   // e.g. AegisGold-v1.4-T1-ASIA, AegisGold-v1.4-R-LON-P2-C (P2 = additional position, C = after a cooldown today)
-   string comment = StringFormat("AegisGold-v1.4-%s-%s%s%s", SetupTag(setup), SessionTag(),
+   // e.g. AegisGold-v1.5-T1-ASIA, AegisGold-v1.5-T0-LON-P2-C (P2 = additional position, C = after a cooldown today)
+   string comment = StringFormat("AegisGold-v1.5-%s-%s%s%s", SetupTag(setup), SessionTag(),
                                  additional_position ? "-P2" : "", g_dailyCooldowns > 0 ? "-C" : "");
    bool request_ok = false;
    if(signal == SIGNAL_LONG)
@@ -1886,6 +1937,8 @@ void ReleaseIndicators()
 {
    if(g_m5EmaHandle != INVALID_HANDLE)
       IndicatorRelease(g_m5EmaHandle);
+   if(g_m5FastEmaHandle != INVALID_HANDLE)
+      IndicatorRelease(g_m5FastEmaHandle);
    if(g_m5AtrHandle != INVALID_HANDLE)
       IndicatorRelease(g_m5AtrHandle);
    if(g_m5RsiHandle != INVALID_HANDLE)
@@ -1897,7 +1950,7 @@ void ReleaseIndicators()
    if(g_m15AtrHandle != INVALID_HANDLE)
       IndicatorRelease(g_m15AtrHandle);
 
-   g_m5EmaHandle = g_m5AtrHandle = g_m5RsiHandle = INVALID_HANDLE;
+   g_m5EmaHandle = g_m5FastEmaHandle = g_m5AtrHandle = g_m5RsiHandle = INVALID_HANDLE;
    g_m15FastEmaHandle = g_m15SlowEmaHandle = g_m15AtrHandle = INVALID_HANDLE;
 }
 
@@ -1929,7 +1982,7 @@ void UpdateDashboard()
       state = "COOLDOWN until " + TimeToString(g_cooldownUntil, TIME_MINUTES);
 
    string dashboard = StringFormat(
-      "Aegis Gold Trend-Pullback v1.40 (two-tier + range mode, 24/5)\n"
+      "Aegis Gold Trend-Pullback v1.50 (T0/T1/T2 + range mode, 24/5)\n"
       "Symbol: %s | Lots: %.2f | Spread: %.3f (max %.2f) | EA positions: %d/%d\n"
       "Today: entries %d/%d | losses %d, streak %d/%d, cooldowns %d | net %.2f %s\n"
       "Regime: %s | Last setup: %s | State: %s\n"
@@ -1954,12 +2007,14 @@ void PrintRunSummary()
    if(g_runStart <= 0)
       return;
 
-   int setups = g_funnel[FUNNEL_SIGNAL_T1] + g_funnel[FUNNEL_SIGNAL_T2] + g_funnel[FUNNEL_SIGNAL_RANGE];
-   PrintFormat("AegisGold setup funnel: %d qualified setups (T1 %d, T2 %d, range %d), orders placed %d (%d as an additional position). "
+   int setups = g_funnel[FUNNEL_SIGNAL_T0] + g_funnel[FUNNEL_SIGNAL_T1] + g_funnel[FUNNEL_SIGNAL_T2] +
+                g_funnel[FUNNEL_SIGNAL_RANGE];
+   PrintFormat("AegisGold setup funnel: %d qualified setups (T0 %d, T1 %d, T2 %d, range %d), orders placed %d (%d as an additional position). "
                "Blocked by: daily halt %d, cooldown %d, open position/order %d, session %d, market close %d, "
                "spread %d, shock %d, runaway %d, news %d, chase %d, no swing %d, stop too wide %d, "
                "worst-case daily loss %d, margin %d, other %d",
-               setups, g_funnel[FUNNEL_SIGNAL_T1], g_funnel[FUNNEL_SIGNAL_T2], g_funnel[FUNNEL_SIGNAL_RANGE],
+               setups, g_funnel[FUNNEL_SIGNAL_T0], g_funnel[FUNNEL_SIGNAL_T1], g_funnel[FUNNEL_SIGNAL_T2],
+               g_funnel[FUNNEL_SIGNAL_RANGE],
                g_funnel[FUNNEL_PLACED],
                g_placedAdditional, g_funnel[FUNNEL_HALT], g_funnel[FUNNEL_COOLDOWN], g_funnel[FUNNEL_EXPOSURE],
                g_funnel[FUNNEL_SESSION], g_funnel[FUNNEL_MARKET_CLOSE], g_funnel[FUNNEL_SPREAD],
@@ -2038,12 +2093,12 @@ void PrintRunSummary()
       }
    }
 
-   // Index 0 = untagged/unknown; setups T1, T2, range; sessions ASIA, LON, NY, LATE.
-   string setup_names[4]   = {"untagged", "Tier 1", "Tier 2", "Range"};
+   // Index 0 = untagged/unknown; setups T1, T2, range, T0; sessions ASIA, LON, NY, LATE.
+   string setup_names[5]   = {"untagged", "Tier 1", "Tier 2", "Range", "Tier 0"};
    string session_names[5] = {"untagged", "ASIA", "LON", "NY", "LATE"};
-   int    tier_trades[4]    = {0, 0, 0, 0};
-   int    tier_wins[4]      = {0, 0, 0, 0};
-   double tier_net[4]       = {0.0, 0.0, 0.0, 0.0};
+   int    tier_trades[5]    = {0, 0, 0, 0, 0};
+   int    tier_wins[5]      = {0, 0, 0, 0, 0};
+   double tier_net[5]       = {0.0, 0.0, 0.0, 0.0, 0.0};
    int    cooldown_trades   = 0;
    int    cooldown_wins     = 0;
    double cooldown_net      = 0.0;
@@ -2075,6 +2130,8 @@ void PrintRunSummary()
          tier_index = 2;
       else if(StringFind(comment, "-R-") >= 0)
          tier_index = 3;
+      else if(StringFind(comment, "-T0") >= 0)
+         tier_index = 4;
 
       int session_index = 0;
       if(StringFind(comment, "-ASIA") >= 0)
@@ -2141,7 +2198,7 @@ void PrintRunSummary()
                "%d weekdays = %.2f trades/day",
                InpMagicNumber, trades, wins, trades > 0 ? 100.0 * wins / trades : 0.0, net_total,
                AccountInfoString(ACCOUNT_CURRENCY), weekdays, weekdays > 0 ? (double)trades / weekdays : 0.0);
-   for(int tier_index = 1; tier_index <= 3; tier_index++)
+   for(int tier_index = 1; tier_index <= 4; tier_index++)
       PrintFormat("AegisGold   %s: %d trades, %d wins (%.1f%%), net %.2f", setup_names[tier_index],
                   tier_trades[tier_index], tier_wins[tier_index],
                   tier_trades[tier_index] > 0 ? 100.0 * tier_wins[tier_index] / tier_trades[tier_index] : 0.0,
