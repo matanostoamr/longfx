@@ -19,25 +19,26 @@ aegis-gold-mt5/
 - [`docs/LOCKED_STRATEGY_SPEC.md`](docs/LOCKED_STRATEGY_SPEC.md) is the authoritative rulebook.
 - [`MQL5/Experts/AegisGoldTrendPullback.mq5`](MQL5/Experts/AegisGoldTrendPullback.mq5) is the complete EA source.
 
-## Locked defaults (v1.1)
+## Locked defaults (v1.2)
 
+- Trading hours: 24/5. The EA scans every M5 bar, Monday–Friday (server time), while the broker market is open (`InpSessionMode=SESSION_24X5`).
+- Market-close protection: no new entries in the last 15 min of each daily session or the last 60 min before the weekly close; the EA's pending orders are cancelled in those windows. Set `InpNoEntryMinutesBeforeDailyClose` / `InpNoEntryMinutesBeforeWeeklyClose` to 0 to disable.
 - M15 regime: EMA 50 versus EMA 200 plus two-completed-bar EMA50 slope.
 - M5 Keltner Channel: EMA20 basis, ATR20, 1.2 ATR outer bands.
 - Two-tier pullback (Tier 2 checked first):
   - Tier 2 (deep): exhaustion candle touches the outer band with RSI(2) ≤ 15 (≥ 85 for shorts); confirmation closes back inside the band.
-  - Tier 1 (shallow): exhaustion candle touches the EMA20 basis with RSI(2) ≤ 30 (≥ 70 for shorts); confirmation closes back on the trend side of EMA20.
-- Confirmation (both tiers): next closed M5 candle is in the trend direction, closes in the favourable half of its range, beyond the exhaustion close, with true range ≤ 1.5 ATR.
-- Entry: stop order $0.05 beyond the confirmation candle; expires after two M5 bars. Order comment records the tier (`AegisGold-v1.1-T1` / `-T2`).
+  - Tier 1 (shallow): exhaustion candle touches the EMA20 basis with RSI(2) ≤ 35 (≥ 65 for shorts); confirmation closes back on the trend side of EMA20.
+- Confirmation (both tiers): the next closed M5 candle is in the trend direction, closes in the favourable half of its range and beyond the exhaustion close, with true range ≤ 1.5 ATR. The exhaustion, confirmation and current bars must be consecutive (no setup across a market break).
+- Entry: stop order $0.05 beyond the confirmation candle; expires after two M5 bars. The order comment records tier and UTC session, e.g. `AegisGold-v1.2-T1-ASIA`.
 - Volume: fixed 0.02 lot.
-- SL: recent local M5 swing plus 0.15 ATR buffer, minimum $4; maximum adapts to `clamp(1.5 × M15 ATR14, $5, $7)`; setup rejected if structure needs more.
-- TP: `clamp(1.4 × SL distance, $6.00, $9.80)` — 1.4R across the $4.29–$7.00 stop range.
-- Entry window: 07:00–18:00 UTC, Monday–Friday (set `InpUseUtcSessionWindow=false` for the v1.0 London/NY local windows).
-- Daily stop: five entries, two **consecutive** losing positions, or -£14 net strategy P/L—whichever occurs first.
-- Spread, news, volatility-shock, runaway-trend and margin filters unchanged from v1.0.
+- SL: beyond the recent M5 swing and both signal candles, plus a 0.15 ATR buffer; minimum $4; maximum `clamp(1.5 × M15 ATR14, $5, $7)`; setup rejected if structure needs more.
+- TP: `clamp(1.4 × SL distance, $6.00, $9.80)`, i.e. 1.4R across the $4.29–$7.00 stop range.
+- Daily stop: ten entries, two **consecutive** losing positions, or -£14 net strategy P/L, whichever comes first.
+- Spread, news, volatility-shock, runaway-trend and margin filters are unchanged.
 - One position or pending order on the symbol; no martingale, grid, averaging, trailing stop, or break-even mutation.
-- Magic number changed to 26092811 so v1.1 statistics do not mix with v1.0.
+- Magic number 26092812 keeps v1.2 statistics separate from earlier versions.
 
-See section 0 of the spec for the v1.0 → v1.1 change log and the input set that reproduces v1.0 exactly.
+Section 0 of the spec has the change log, the input sets that reproduce v1.1 and v1.0, and the calibration evidence behind these defaults.
 
 ## Installation in MetaTrader 5
 
@@ -104,10 +105,23 @@ Record at minimum:
 - maximum balance and equity drawdown;
 - average and worst slippage;
 - projected/live margin level;
-- results by London and New York window; and
+- results by tier and by session; and
 - results with abnormal news days isolated.
 
-Three to five trades per day is a target, not a guarantee. The EA accepts no more than five fills per day, and zero trades is correct when its conditions are absent. Report Tier 1 and Tier 2 results separately (split by order comment) so the looser Tier 1 trigger can be judged on its own.
+Four to five trades per day is a target, not a guarantee. The EA accepts no more than ten fills per day, and zero trades is correct when its conditions are absent.
+
+### End-of-run report
+
+When a test finishes (or the EA is removed from a chart), the journal prints:
+
+```text
+AegisGold setup funnel: N qualified setups (T1 a, T2 b), orders placed c. Blocked by: daily halt ..., open position/order ..., session ..., market close ..., spread ..., shock ..., runaway ..., news ..., chase ..., no swing ..., stop too wide ..., other ...
+AegisGold results this run (magic 26092812): trades, wins, net, trades/day
+AegisGold   Tier 1: ... / Tier 2: ...
+AegisGold   ASIA / LON / NY / LATE: ...
+```
+
+The funnel shows which rule is limiting trade frequency. Judge each tier and session separately, especially the Asian hours that are new in v1.2.
 
 ## Pepperstone cost context
 
@@ -131,7 +145,8 @@ Content sourced from external documentation has been rephrased for licensing com
 - Manual positions or orders on the same symbol block new EA exposure.
 - A daily halt cancels the EA's pending order but does not force-close a protected open position.
 - Daily statistics use the EA magic number and chart symbol, and reset at MT5 trade-server midnight.
-- The chart dashboard shows spread, daily entries, daily losses, net P/L, halt state, and the latest decision.
+- Pending orders are cancelled, and no new entries are placed, near the daily and weekly market close (market-close protection).
+- The chart dashboard shows spread, daily entries, daily losses, net P/L, halt state, last signal tier, and the latest decision.
 
 ## Known validation boundary
 

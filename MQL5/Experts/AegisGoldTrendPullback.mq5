@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.10"
-#property description "Aegis XAU/USD M15 regime and M5 two-tier Keltner-RSI pullback EA (v1.1 active)"
+#property version   "1.20"
+#property description "Aegis XAU/USD M15 regime and M5 two-tier Keltner-RSI pullback EA (v1.2, 24/5)"
 
 #include <Trade/Trade.mqh>
 
@@ -19,8 +19,34 @@ enum DailyLossCountMode
    LOSS_COUNT_TOTAL       = 1  // Halt after N losing positions in total (v1.0 behaviour)
 };
 
+enum EntrySessionMode
+{
+   SESSION_24X5       = 0, // 24/5: scan every M5 bar while the market is open (v1.2)
+   SESSION_UTC_WINDOW = 1, // Single UTC window (v1.1: 07:00-18:00 UTC)
+   SESSION_LONDON_NY  = 2  // London + New York local windows (v1.0)
+};
+
+// Setup-funnel counters: every qualified setup is counted once, then either
+// attributed to the first gate that blocked it or counted as placed.
+#define FUNNEL_SIGNAL_T1      0
+#define FUNNEL_SIGNAL_T2      1
+#define FUNNEL_HALT           2
+#define FUNNEL_EXPOSURE       3
+#define FUNNEL_SESSION        4
+#define FUNNEL_MARKET_CLOSE   5
+#define FUNNEL_SPREAD         6
+#define FUNNEL_SHOCK          7
+#define FUNNEL_RUNAWAY        8
+#define FUNNEL_NEWS           9
+#define FUNNEL_CHASE          10
+#define FUNNEL_NO_SWING       11
+#define FUNNEL_STOP_TOO_WIDE  12
+#define FUNNEL_OTHER          13
+#define FUNNEL_PLACED         14
+#define FUNNEL_SIZE           15
+
 input group "Identity and account safety"
-input ulong  InpMagicNumber                  = 26092811;
+input ulong  InpMagicNumber                  = 26092812;
 input bool   InpRequireGBPAccount             = true;
 input double InpFixedLots                     = 0.02;
 input double InpMinimumProjectedMarginLevel   = 120.0;
@@ -38,8 +64,8 @@ input double InpMaxConfirmationRangeAtr       = 1.50;
 
 input group "Tier 1: shallow pullback to Keltner middle (EMA20)"
 input bool   InpEnableTier1                   = true;
-input double InpTier1RsiLongThreshold         = 30.0;
-input double InpTier1RsiShortThreshold        = 70.0;
+input double InpTier1RsiLongThreshold         = 35.0;
+input double InpTier1RsiShortThreshold        = 65.0;
 input bool   InpTier1RequireBasisReclaim      = true;
 
 input group "Tier 2: deep pullback to outer Keltner band"
@@ -54,19 +80,25 @@ input double InpMaxEntryAdjustmentPrice       = 0.20;
 input int    InpPendingExpiryBars             = 2;
 input int    InpSwingLookbackBars             = 12;
 input double InpSwingAtrBuffer                = 0.15;
+// Stop always beyond both signal candles (false = v1.1 swing search)
+input bool   InpStopBeyondSignalCandles       = true;
 input double InpMinimumStopPrice              = 4.00;
 input bool   InpUseAdaptiveMaxStop            = true;
 input int    InpM15AtrPeriod                  = 14;
 input double InpAdaptiveStopM15AtrMultiple    = 1.50;
-input double InpMaximumStopPrice              = 5.00;  // Fixed max stop, and floor of the adaptive max
-input double InpAbsoluteMaximumStopPrice      = 7.00;  // Hard ceiling of the adaptive max
+// Fixed max stop, and floor of the adaptive max
+input double InpMaximumStopPrice              = 5.00;
+// Hard ceiling of the adaptive max
+input double InpAbsoluteMaximumStopPrice      = 7.00;
 input double InpRewardMultiple                = 1.40;
 input double InpMinimumTargetPrice            = 6.00;
-input double InpMaximumTargetPrice            = 9.80;  // 1.4 x $7.00 keeps 1.4R at the widest stop
+// 1.4 x $7.00 keeps 1.4R at the widest stop
+input double InpMaximumTargetPrice            = 9.80;
 input int    InpMaximumDeviationPoints        = 20;
 
 input group "Sessions"
-input bool   InpUseUtcSessionWindow           = true;  // true: single UTC window; false: v1.0 London/NY local windows
+input EntrySessionMode InpSessionMode         = SESSION_24X5;
+// Used only by SESSION_UTC_WINDOW
 input int    InpUtcSessionStartHour           = 7;
 input int    InpUtcSessionEndHour             = 18;
 input int    InpLondonStartHour               = 8;
@@ -75,6 +107,12 @@ input int    InpNewYorkStartHour              = 8;
 input int    InpNewYorkEndHour                = 12;
 input bool   InpTesterUsesPepperstoneServer   = true;
 input int    InpFallbackServerUtcOffsetHours  = 2;
+
+input group "Market-close protection (broker session table)"
+// 0 = off. No new entries, pending orders cancelled
+input int    InpNoEntryMinutesBeforeDailyClose  = 15;
+// 0 = off. Same, before the last session of the week
+input int    InpNoEntryMinutesBeforeWeeklyClose = 60;
 
 input group "Abnormal-condition filters"
 input double InpMaximumSpreadPrice            = 0.30;
@@ -90,7 +128,7 @@ input double InpRunawayDistanceAtr            = 2.50;
 input double InpRunawayBodyAtr                = 0.80;
 
 input group "Daily controls (account currency)"
-input int    InpMaximumDailyEntries           = 5;
+input int    InpMaximumDailyEntries           = 10;
 input int    InpMaximumDailyLosses            = 2;
 input DailyLossCountMode InpDailyLossCountMode = LOSS_COUNT_CONSECUTIVE;
 input double InpMaximumDailyDrawdown          = 14.0;
@@ -110,6 +148,8 @@ int      g_lastSignalTier    = 0;
 double   g_dailyNet          = 0.0;
 bool     g_dailyHalted       = false;
 string   g_status            = "Initializing";
+int      g_funnel[FUNNEL_SIZE];       // setup funnel for the end-of-run report
+datetime g_runStart          = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -170,9 +210,12 @@ int OnInit()
    Trade.SetTypeFillingBySymbol(_Symbol);
    Trade.SetAsyncMode(false);
 
+   ArrayInitialize(g_funnel, 0);
+   g_runStart = TimeCurrent();
    g_lastM5BarTime = iTime(_Symbol, PERIOD_M5, 0);
    RefreshDailyStats();
    LogSymbolConfiguration();
+   LogTradeSessions();
 
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
       Print("Warning: automated trading is currently disabled; enable Algo Trading before demo operation.");
@@ -187,6 +230,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   PrintRunSummary();
    ReleaseIndicators();
    Comment("");
 }
@@ -198,8 +242,11 @@ void OnTick()
 {
    RefreshDailyStatsIfNeeded();
 
+   string close_reason = "";
    if(g_dailyHalted)
       CancelOwnPendingOrders("daily halt");
+   else if(OrdersTotal() > 0 && IsNearMarketClose(close_reason))
+      CancelOwnPendingOrders("market-close protection");
    else
       CancelExpiredOwnPendingOrders();
 
@@ -249,6 +296,8 @@ bool InputsAreValid()
    if(InpUtcSessionStartHour < 0 || InpUtcSessionStartHour > 23 || InpUtcSessionEndHour < 1 ||
       InpUtcSessionEndHour > 24 || InpUtcSessionStartHour >= InpUtcSessionEndHour)
       valid = false;
+   if(InpNoEntryMinutesBeforeDailyClose < 0 || InpNoEntryMinutesBeforeWeeklyClose < 0)
+      valid = false;
    if(InpPendingExpiryBars < 1 || InpSwingLookbackBars < 3 || InpAtrMedianLookbackBars < 10 ||
       InpNormalBarsAfterShock < 1)
       valid = false;
@@ -293,6 +342,9 @@ bool VolumeIsValid(const double volume)
 
 //+------------------------------------------------------------------+
 //| Evaluate the strategy exactly once per new M5 bar                |
+//| Every qualified setup is counted, then attributed to the first   |
+//| gate that blocks it (or to "placed"), so the end-of-run funnel   |
+//| shows exactly what each rule costs in trade frequency.           |
 //+------------------------------------------------------------------+
 void EvaluateNewM5Bar()
 {
@@ -300,44 +352,36 @@ void EvaluateNewM5Bar()
    CancelExpiredOwnPendingOrders();
 
    if(g_dailyHalted)
-   {
-      SetStatus(DailyHaltDescription());
       CancelOwnPendingOrders("daily halt");
-      return;
-   }
 
-   if(HasAnyPositionForSymbol())
+   // Setup-independent gates, evaluated first so the dashboard keeps showing why the EA is idle.
+   int    gate_stage   = -1;
+   string gate_status  = "";
+   string close_reason = "";
+   if(g_dailyHalted)
    {
-      SetStatus("Existing symbol position; no overlapping exposure");
-      return;
+      gate_stage  = FUNNEL_HALT;
+      gate_status = DailyHaltDescription();
    }
-
-   if(HasAnyPendingOrderForSymbol())
+   else if(HasAnyPositionForSymbol())
    {
-      SetStatus("Existing symbol pending order; waiting for resolution");
-      return;
+      gate_stage  = FUNNEL_EXPOSURE;
+      gate_status = "Existing symbol position; no overlapping exposure";
    }
-
-   if(!IsEntrySession())
+   else if(HasAnyPendingOrderForSymbol())
    {
-      SetStatus(InpUseUtcSessionWindow
-                ? StringFormat("Outside %02d:00-%02d:00 UTC entry window", InpUtcSessionStartHour, InpUtcSessionEndHour)
-                : "Outside London/New York entry windows");
-      return;
+      gate_stage  = FUNNEL_EXPOSURE;
+      gate_status = "Existing symbol pending order; waiting for resolution";
    }
-
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0.0 || tick.bid <= 0.0)
+   else if(!IsEntrySession())
    {
-      SetStatus("No valid symbol tick");
-      return;
+      gate_stage  = FUNNEL_SESSION;
+      gate_status = SessionBlockDescription();
    }
-
-   double spread_price = tick.ask - tick.bid;
-   if(spread_price > InpMaximumSpreadPrice)
+   else if(IsNearMarketClose(close_reason))
    {
-      SetStatus(StringFormat("Spread blocked: %.3f > %.3f", spread_price, InpMaximumSpreadPrice));
-      return;
+      gate_stage  = FUNNEL_MARKET_CLOSE;
+      gate_status = close_reason;
    }
 
    MqlRates rates[];
@@ -349,19 +393,7 @@ void EvaluateNewM5Bar()
    double m15_atr[];
    if(!LoadStrategyData(rates, ema, atr, rsi, m15_fast, m15_slow, m15_atr))
    {
-      SetStatus("Waiting for sufficient indicator history");
-      return;
-   }
-
-   if(IsVolatilityShock(rates, atr))
-   {
-      SetStatus("Volatility-shock cooldown active");
-      return;
-   }
-
-   if(IsRunawayMarket(rates, ema, atr))
-   {
-      SetStatus("Runaway-trend filter active");
+      SetStatus(gate_stage >= 0 ? gate_status : "Waiting for sufficient indicator history");
       return;
    }
 
@@ -369,18 +401,59 @@ void EvaluateNewM5Bar()
    SignalDirection signal = BuildSignal(rates, ema, atr, rsi, m15_fast, m15_slow, tier);
    if(signal == SIGNAL_NONE)
    {
-      SetStatus("No qualified closed-candle setup");
+      SetStatus(gate_stage >= 0 ? gate_status : "No qualified closed-candle setup");
+      return;
+   }
+
+   g_funnel[tier == 1 ? FUNNEL_SIGNAL_T1 : FUNNEL_SIGNAL_T2]++;
+   if(gate_stage >= 0)
+   {
+      BlockSetup(gate_stage, StringFormat("%s; tier %d %s setup skipped", gate_status, tier,
+                                          signal == SIGNAL_LONG ? "long" : "short"));
+      return;
+   }
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0.0 || tick.bid <= 0.0)
+   {
+      BlockSetup(FUNNEL_OTHER, "No valid symbol tick");
+      return;
+   }
+
+   double spread_price = tick.ask - tick.bid;
+   if(spread_price > InpMaximumSpreadPrice)
+   {
+      BlockSetup(FUNNEL_SPREAD, StringFormat("Spread blocked: %.3f > %.3f", spread_price, InpMaximumSpreadPrice));
+      return;
+   }
+
+   if(IsVolatilityShock(rates, atr))
+   {
+      BlockSetup(FUNNEL_SHOCK, "Volatility-shock cooldown active");
+      return;
+   }
+
+   if(IsRunawayMarket(rates, ema, atr))
+   {
+      BlockSetup(FUNNEL_RUNAWAY, "Runaway-trend filter active");
       return;
    }
 
    if(IsHighImpactUsdNewsWindow())
    {
-      SetStatus("High-impact USD news window or unavailable calendar");
+      BlockSetup(FUNNEL_NEWS, "High-impact USD news window or unavailable calendar");
       return;
    }
 
    g_lastSignalTier = tier;
-   PlaceProtectedPendingOrder(signal, tier, rates, atr, CurrentMaximumStopPrice(m15_atr), tick);
+   int stage = PlaceProtectedPendingOrder(signal, tier, rates, atr, CurrentMaximumStopPrice(m15_atr), tick);
+   g_funnel[stage]++;
+}
+
+void BlockSetup(const int stage, const string status)
+{
+   g_funnel[stage]++;
+   SetStatus(status);
 }
 
 //+------------------------------------------------------------------+
@@ -444,14 +517,21 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
 //| Tier 2 (deep): exhaustion bar reaches the outer band (1.2 ATR)   |
 //|                with RSI(2) <= 15 / >= 85.                        |
 //| Tier 1 (shallow): exhaustion bar reaches the EMA20 basis with    |
-//|                RSI(2) <= 30 / >= 70, and confirmation reclaims   |
+//|                RSI(2) <= 35 / >= 65, and confirmation reclaims   |
 //|                the basis. Tier 2 is checked first.               |
+//| The exhaustion bar, confirmation bar and current bar must be     |
+//| consecutive M5 bars, so no setup spans a market break.           |
 //+------------------------------------------------------------------+
 SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const double &atr[],
                             const double &rsi[], const double &m15_fast[], const double &m15_slow[],
                             int &tier)
 {
    tier = 0;
+   long bar_seconds = (long)PeriodSeconds(PERIOD_M5);
+   if((long)rates[0].time - (long)rates[1].time != bar_seconds ||
+      (long)rates[1].time - (long)rates[2].time != bar_seconds)
+      return SIGNAL_NONE;
+
    int slope_shift = 1 + InpM15SlopeLookbackBars;
    bool long_regime  = (m15_fast[1] > m15_slow[1] && m15_fast[1] > m15_fast[slope_shift]);
    bool short_regime = (m15_fast[1] < m15_slow[1] && m15_fast[1] < m15_fast[slope_shift]);
@@ -523,15 +603,15 @@ SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const 
 //+------------------------------------------------------------------+
 //| Place a broker-side protected stop entry                         |
 //+------------------------------------------------------------------+
-void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, const MqlRates &rates[],
-                                const double &atr[], const double maximum_stop, const MqlTick &tick)
+int PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, const MqlRates &rates[],
+                               const double &atr[], const double maximum_stop, const MqlTick &tick)
 {
    ENUM_SYMBOL_TRADE_MODE trade_mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if((signal == SIGNAL_LONG && trade_mode == SYMBOL_TRADE_MODE_SHORTONLY) ||
       (signal == SIGNAL_SHORT && trade_mode == SYMBOL_TRADE_MODE_LONGONLY))
    {
       SetStatus("Broker symbol direction restriction blocked setup");
-      return;
+      return FUNNEL_OTHER;
    }
 
    double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -539,7 +619,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
    if(tick_size <= 0.0 || point <= 0.0)
    {
       SetStatus("Invalid symbol tick-size metadata");
-      return;
+      return FUNNEL_OTHER;
    }
 
    double broker_stop_gap = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
@@ -554,7 +634,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
       if(entry - desired_entry > InpMaxEntryAdjustmentPrice + tick_size * 0.5)
       {
          SetStatus("Buy trigger already missed beyond chase allowance");
-         return;
+         return FUNNEL_CHASE;
       }
    }
    else
@@ -564,7 +644,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
       if(desired_entry - entry > InpMaxEntryAdjustmentPrice + tick_size * 0.5)
       {
          SetStatus("Sell trigger already missed beyond chase allowance");
-         return;
+         return FUNNEL_CHASE;
       }
    }
 
@@ -572,10 +652,26 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
    bool swing_found = (signal == SIGNAL_LONG)
                       ? FindMostRecentSwingLow(rates, swing_price)
                       : FindMostRecentSwingHigh(rates, swing_price);
+   if(InpStopBeyondSignalCandles)
+   {
+      // The stop must also clear both signal candles. Without this, a confirmation candle that
+      // undercuts (or overshoots) the exhaustion candle pushes the swing search to older bars and
+      // can leave the stop inside the setup's own range, or on the wrong side of the entry.
+      double pattern_extreme = (signal == SIGNAL_LONG)
+                               ? MathMin(rates[1].low, rates[2].low)
+                               : MathMax(rates[1].high, rates[2].high);
+      if(!swing_found)
+         swing_price = pattern_extreme;
+      else if(signal == SIGNAL_LONG)
+         swing_price = MathMin(swing_price, pattern_extreme);
+      else
+         swing_price = MathMax(swing_price, pattern_extreme);
+      swing_found = true;
+   }
    if(!swing_found)
    {
       SetStatus("No confirmed structural swing in lookback");
-      return;
+      return FUNNEL_NO_SWING;
    }
 
    double structural_stop = (signal == SIGNAL_LONG)
@@ -588,14 +684,14 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
    if(structural_distance <= 0.0)
    {
       SetStatus("Structural stop lies on invalid side of entry");
-      return;
+      return FUNNEL_OTHER;
    }
 
    if(structural_distance > maximum_stop + tick_size * 0.5)
    {
       SetStatus(StringFormat("Structure needs %.2f stop; current maximum is %.2f",
                              structural_distance, maximum_stop));
-      return;
+      return FUNNEL_STOP_TOO_WIDE;
    }
 
    double stop_distance = MathMax(structural_distance, InpMinimumStopPrice);
@@ -609,7 +705,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
    if(stop_distance > maximum_stop + tick_size)
    {
       SetStatus("Tick normalization pushed stop beyond maximum");
-      return;
+      return FUNNEL_STOP_TOO_WIDE;
    }
 
    double target_distance = Clamp(stop_distance * InpRewardMultiple,
@@ -621,11 +717,11 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
    if(MathAbs(entry - stop_loss) < minimum_gap || MathAbs(take_profit - entry) < minimum_gap)
    {
       SetStatus("Broker minimum stop distance rejected SL/TP geometry");
-      return;
+      return FUNNEL_OTHER;
    }
 
    if(!HasSufficientMargin(signal, entry))
-      return;
+      return FUNNEL_OTHER;
 
    ENUM_ORDER_TYPE_TIME order_time = ORDER_TIME_GTC;
    datetime expiration = 0;
@@ -636,7 +732,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
       expiration = iTime(_Symbol, PERIOD_M5, 0) + InpPendingExpiryBars * PeriodSeconds(PERIOD_M5);
    }
 
-   string comment = StringFormat("AegisGold-v1.1-T%d", tier);
+   string comment = StringFormat("AegisGold-v1.2-T%d-%s", tier, SessionTag());
    bool request_ok = false;
    if(signal == SIGNAL_LONG)
       request_ok = Trade.BuyStop(InpFixedLots, entry, _Symbol, stop_loss, take_profit,
@@ -652,7 +748,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
       SetStatus(StringFormat("Order rejected: %u %s", retcode, Trade.ResultRetcodeDescription()));
       PrintFormat("Order request failed. retcode=%u description=%s entry=%.3f sl=%.3f tp=%.3f",
                   retcode, Trade.ResultRetcodeDescription(), entry, stop_loss, take_profit);
-      return;
+      return FUNNEL_OTHER;
    }
 
    SetStatus(StringFormat("Tier %d %s stop placed: entry %.3f SL %.3f TP %.3f",
@@ -661,6 +757,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, co
                tier, signal == SIGNAL_LONG ? "buy" : "sell", Trade.ResultOrder(), InpFixedLots,
                entry, stop_loss, take_profit, MathAbs(entry - stop_loss), MathAbs(take_profit - entry),
                maximum_stop);
+   return FUNNEL_PLACED;
 }
 
 //+------------------------------------------------------------------+
@@ -830,17 +927,27 @@ bool IsHighImpactUsdNewsWindow()
 }
 
 //+------------------------------------------------------------------+
-//| Session filter with UK and US daylight-saving rules              |
+//| Session filter                                                   |
+//| 24/5: any bar Monday-Friday in broker server time (the broker's  |
+//| own session table decides when the market is actually open).     |
+//| UTC window / London+NY: legacy v1.1 / v1.0 behaviour.            |
 //+------------------------------------------------------------------+
 bool IsEntrySession()
 {
+   if(InpSessionMode == SESSION_24X5)
+   {
+      MqlDateTime server_parts;
+      TimeToStruct(ServerNow(), server_parts);
+      return (server_parts.day_of_week != 0 && server_parts.day_of_week != 6);
+   }
+
    datetime utc = CurrentUtcTime();
    MqlDateTime utc_parts;
    TimeToStruct(utc, utc_parts);
    if(utc_parts.day_of_week == 0 || utc_parts.day_of_week == 6)
       return false;
 
-   if(InpUseUtcSessionWindow)
+   if(InpSessionMode == SESSION_UTC_WINDOW)
       return IsHourWindow(utc, InpUtcSessionStartHour, InpUtcSessionEndHour);
 
    int london_offset = IsUkDaylightSaving(utc) ? 1 : 0;
@@ -850,6 +957,152 @@ bool IsEntrySession()
    datetime new_york_local = utc + new_york_offset * 3600;
    return IsHourWindow(london_local, InpLondonStartHour, InpLondonEndHour) ||
           IsHourWindow(new_york_local, InpNewYorkStartHour, InpNewYorkEndHour);
+}
+
+string SessionBlockDescription()
+{
+   if(InpSessionMode == SESSION_UTC_WINDOW)
+      return StringFormat("Outside %02d:00-%02d:00 UTC entry window",
+                          InpUtcSessionStartHour, InpUtcSessionEndHour);
+   if(InpSessionMode == SESSION_LONDON_NY)
+      return "Outside London/New York entry windows";
+   return "Weekend (server time)";
+}
+
+//+------------------------------------------------------------------+
+//| UTC session tag used in order comments and the run report        |
+//+------------------------------------------------------------------+
+string SessionTag()
+{
+   MqlDateTime utc_parts;
+   TimeToStruct(CurrentUtcTime(), utc_parts);
+   if(utc_parts.hour >= 7 && utc_parts.hour < 12)
+      return "LON";
+   if(utc_parts.hour >= 12 && utc_parts.hour < 17)
+      return "NY";
+   if(utc_parts.hour >= 17 && utc_parts.hour < 21)
+      return "LATE";
+   return "ASIA";
+}
+
+datetime ServerNow()
+{
+   datetime now = TimeTradeServer();
+   if(now <= 0)
+      now = TimeCurrent();
+   return now;
+}
+
+//+------------------------------------------------------------------+
+//| Market-close protection                                          |
+//| No new entry (and no live pending order) in the last N minutes   |
+//| of a broker trade session: avoids rollover spread spikes and     |
+//| opening a position just before the weekend gap. Uses the symbol  |
+//| session table; if it is empty, server midnight is assumed.       |
+//+------------------------------------------------------------------+
+bool IsNearMarketClose(string &reason)
+{
+   if(InpNoEntryMinutesBeforeDailyClose <= 0 && InpNoEntryMinutesBeforeWeeklyClose <= 0)
+      return false;
+
+   bool weekly_close = false;
+   long seconds_left = SecondsToSessionClose(ServerNow(), weekly_close);
+   if(seconds_left < 0)
+      return false;
+
+   int limit_minutes = weekly_close ? InpNoEntryMinutesBeforeWeeklyClose : InpNoEntryMinutesBeforeDailyClose;
+   if(limit_minutes <= 0 || seconds_left > (long)limit_minutes * 60)
+      return false;
+
+   reason = StringFormat("%s market close in %d min; no new entries in the last %d min",
+                         weekly_close ? "Weekly" : "Daily", (int)(seconds_left / 60), limit_minutes);
+   return true;
+}
+
+long SecondsToSessionClose(const datetime server_time, bool &weekly_close)
+{
+   weekly_close = false;
+   MqlDateTime parts;
+   TimeToStruct(server_time, parts);
+   long now_seconds = (long)parts.hour * 3600 + (long)parts.min * 60 + (long)parts.sec;
+   int day = parts.day_of_week;
+
+   long session_end = 0;
+   if(!FindSessionEnd(day, now_seconds, session_end))
+   {
+      weekly_close = (parts.day_of_week == 5);
+      return 86400 - now_seconds;
+   }
+
+   long seconds_left = session_end - now_seconds;
+   // Follow sessions that run through midnight into the next day without a break.
+   for(int hops = 0; hops < 7 && session_end >= 86400; hops++)
+   {
+      int next_day = (day + 1) % 7;
+      long next_end = 0;
+      if(!FindSessionEnd(next_day, 0, next_end))
+         break;
+      day = next_day;
+      seconds_left += next_end;
+      session_end = next_end;
+   }
+
+   weekly_close = !DayHasTradeSession((day + 1) % 7);
+   return seconds_left;
+}
+
+bool FindSessionEnd(const int day_of_week, const long second_of_day, long &session_end)
+{
+   datetime from_time = 0;
+   datetime to_time = 0;
+   for(int index = 0; index < 16; index++)
+   {
+      if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)day_of_week, (uint)index, from_time, to_time))
+         return false;
+      long from_seconds = (long)from_time % 86400;
+      long to_seconds = (long)to_time % 86400;
+      if(to_seconds <= from_seconds)
+         to_seconds = 86400;
+      if(second_of_day >= from_seconds && second_of_day < to_seconds)
+      {
+         session_end = to_seconds;
+         return true;
+      }
+   }
+   return false;
+}
+
+bool DayHasTradeSession(const int day_of_week)
+{
+   datetime from_time = 0;
+   datetime to_time = 0;
+   return SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)day_of_week, 0, from_time, to_time);
+}
+
+void LogTradeSessions()
+{
+   string names[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+   string text = "";
+   for(int day = 0; day < 7; day++)
+   {
+      datetime from_time = 0;
+      datetime to_time = 0;
+      string day_text = "";
+      for(int index = 0; index < 16; index++)
+      {
+         if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)day, (uint)index, from_time, to_time))
+            break;
+         long from_seconds = (long)from_time % 86400;
+         long to_seconds = (long)to_time % 86400;
+         if(to_seconds <= from_seconds)
+            to_seconds = 86400;
+         day_text += StringFormat("%s%02d:%02d-%02d:%02d", day_text == "" ? "" : ",",
+                                  (int)(from_seconds / 3600), (int)((from_seconds % 3600) / 60),
+                                  (int)(to_seconds / 3600), (int)((to_seconds % 3600) / 60));
+      }
+      text += StringFormat("%s %s; ", names[day], day_text == "" ? "closed" : day_text);
+   }
+   PrintFormat("AegisGold trade sessions (server time): %s", text);
 }
 
 bool IsHourWindow(const datetime local_time, const int start_hour, const int end_hour)
@@ -1265,7 +1518,7 @@ void UpdateDashboard()
       spread = tick.ask - tick.bid;
 
    string dashboard = StringFormat(
-      "Aegis Gold Trend-Pullback v1.10 (two-tier)\n"
+      "Aegis Gold Trend-Pullback v1.20 (two-tier, 24/5)\n"
       "Symbol: %s | Lots: %.2f | Spread: %.3f\n"
       "Today: entries %d/%d | losses %d total, %d consecutive (halt at %d %s) | net %.2f %s\n"
       "Last signal tier: %d | Halted: %s | Status: %s",
@@ -1276,6 +1529,156 @@ void UpdateDashboard()
       g_dailyNet, AccountInfoString(ACCOUNT_CURRENCY),
       g_lastSignalTier, g_dailyHalted ? "YES" : "NO", g_status);
    Comment(dashboard);
+}
+
+//+------------------------------------------------------------------+
+//| End-of-run report (Strategy Tester journal / Experts log):       |
+//| setup funnel for this run, then this run's closed trades for the |
+//| magic number, split by tier and UTC session (order comment).     |
+//+------------------------------------------------------------------+
+void PrintRunSummary()
+{
+   if(g_runStart <= 0)
+      return;
+
+   int setups = g_funnel[FUNNEL_SIGNAL_T1] + g_funnel[FUNNEL_SIGNAL_T2];
+   PrintFormat("AegisGold setup funnel: %d qualified setups (T1 %d, T2 %d), orders placed %d. Blocked by: "
+               "daily halt %d, open position/order %d, session %d, market close %d, spread %d, shock %d, "
+               "runaway %d, news %d, chase %d, no swing %d, stop too wide %d, other %d",
+               setups, g_funnel[FUNNEL_SIGNAL_T1], g_funnel[FUNNEL_SIGNAL_T2], g_funnel[FUNNEL_PLACED],
+               g_funnel[FUNNEL_HALT], g_funnel[FUNNEL_EXPOSURE], g_funnel[FUNNEL_SESSION],
+               g_funnel[FUNNEL_MARKET_CLOSE], g_funnel[FUNNEL_SPREAD], g_funnel[FUNNEL_SHOCK],
+               g_funnel[FUNNEL_RUNAWAY], g_funnel[FUNNEL_NEWS], g_funnel[FUNNEL_CHASE],
+               g_funnel[FUNNEL_NO_SWING], g_funnel[FUNNEL_STOP_TOO_WIDE], g_funnel[FUNNEL_OTHER]);
+
+   datetime now = TimeCurrent();
+   if(!HistorySelect(g_runStart, now + 60))
+      return;
+
+   // Aggregate every deal of this EA by position ID.
+   ulong  position_ids[];
+   double position_net[];
+   ulong  entry_orders[];
+   bool   position_closed[];
+   int deals_total = HistoryDealsTotal();
+   for(int index = 0; index < deals_total; index++)
+   {
+      ulong deal_ticket = HistoryDealGetTicket(index);
+      if(deal_ticket == 0 ||
+         (ulong)HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) != InpMagicNumber ||
+         HistoryDealGetString(deal_ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+
+      ulong position_id = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+      int slot = -1;
+      for(int search = 0; search < ArraySize(position_ids); search++)
+      {
+         if(position_ids[search] == position_id)
+         {
+            slot = search;
+            break;
+         }
+      }
+      if(slot < 0)
+      {
+         slot = ArraySize(position_ids);
+         ArrayResize(position_ids, slot + 1);
+         ArrayResize(position_net, slot + 1);
+         ArrayResize(entry_orders, slot + 1);
+         ArrayResize(position_closed, slot + 1);
+         position_ids[slot] = position_id;
+         position_net[slot] = 0.0;
+         entry_orders[slot] = 0;
+         position_closed[slot] = false;
+      }
+
+      position_net[slot] += DealNetResult(deal_ticket);
+      ENUM_DEAL_ENTRY entry_type = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+      if(entry_type == DEAL_ENTRY_IN && entry_orders[slot] == 0)
+         entry_orders[slot] = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
+      if(entry_type == DEAL_ENTRY_OUT || entry_type == DEAL_ENTRY_OUT_BY || entry_type == DEAL_ENTRY_INOUT)
+         position_closed[slot] = true;
+   }
+
+   // Index 0 = untagged/unknown; tiers 1-2; sessions ASIA, LON, NY, LATE.
+   string session_names[5] = {"untagged", "ASIA", "LON", "NY", "LATE"};
+   int    tier_trades[3]    = {0, 0, 0};
+   int    tier_wins[3]      = {0, 0, 0};
+   double tier_net[3]       = {0.0, 0.0, 0.0};
+   int    session_trades[5] = {0, 0, 0, 0, 0};
+   int    session_wins[5]   = {0, 0, 0, 0, 0};
+   double session_net[5]    = {0.0, 0.0, 0.0, 0.0, 0.0};
+   int    trades = 0;
+   int    wins = 0;
+   double net_total = 0.0;
+
+   for(int slot = 0; slot < ArraySize(position_ids); slot++)
+   {
+      if(!position_closed[slot])
+         continue;
+
+      string comment = (entry_orders[slot] > 0) ? HistoryOrderGetString(entry_orders[slot], ORDER_COMMENT) : "";
+      int tier_index = 0;
+      if(StringFind(comment, "-T1") >= 0)
+         tier_index = 1;
+      else if(StringFind(comment, "-T2") >= 0)
+         tier_index = 2;
+
+      int session_index = 0;
+      if(StringFind(comment, "-ASIA") >= 0)
+         session_index = 1;
+      else if(StringFind(comment, "-LON") >= 0)
+         session_index = 2;
+      else if(StringFind(comment, "-NY") >= 0)
+         session_index = 3;
+      else if(StringFind(comment, "-LATE") >= 0)
+         session_index = 4;
+
+      bool win = (position_net[slot] > 0.0);
+      trades++;
+      net_total += position_net[slot];
+      tier_trades[tier_index]++;
+      tier_net[tier_index] += position_net[slot];
+      session_trades[session_index]++;
+      session_net[session_index] += position_net[slot];
+      if(win)
+      {
+         wins++;
+         tier_wins[tier_index]++;
+         session_wins[session_index]++;
+      }
+   }
+
+   int weekdays = 0;
+   if(g_runStart > 0 && now > g_runStart)
+   {
+      for(datetime day = StartOfDay(g_runStart); day <= now; day += 86400)
+      {
+         MqlDateTime day_parts;
+         TimeToStruct(day, day_parts);
+         if(day_parts.day_of_week != 0 && day_parts.day_of_week != 6)
+            weekdays++;
+      }
+   }
+
+   PrintFormat("AegisGold results this run (magic %I64u): %d closed trades, %d wins (%.1f%%), net %.2f %s | "
+               "%d weekdays = %.2f trades/day",
+               InpMagicNumber, trades, wins, trades > 0 ? 100.0 * wins / trades : 0.0, net_total,
+               AccountInfoString(ACCOUNT_CURRENCY), weekdays, weekdays > 0 ? (double)trades / weekdays : 0.0);
+   for(int tier_index = 1; tier_index <= 2; tier_index++)
+      PrintFormat("AegisGold   Tier %d: %d trades, %d wins (%.1f%%), net %.2f", tier_index,
+                  tier_trades[tier_index], tier_wins[tier_index],
+                  tier_trades[tier_index] > 0 ? 100.0 * tier_wins[tier_index] / tier_trades[tier_index] : 0.0,
+                  tier_net[tier_index]);
+   for(int session_index = 0; session_index < 5; session_index++)
+   {
+      if(session_trades[session_index] == 0)
+         continue;
+      PrintFormat("AegisGold   %s: %d trades, %d wins (%.1f%%), net %.2f", session_names[session_index],
+                  session_trades[session_index], session_wins[session_index],
+                  100.0 * session_wins[session_index] / session_trades[session_index],
+                  session_net[session_index]);
+   }
 }
 
 void LogSymbolConfiguration()
