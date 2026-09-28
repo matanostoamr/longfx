@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.20"
-#property description "Aegis XAU/USD M15 regime and M5 two-tier Keltner-RSI pullback EA (v1.2, 24/5)"
+#property version   "1.30"
+#property description "Aegis XAU/USD M15 regime and M5 two-tier Keltner-RSI pullback EA (v1.3, 24/5)"
 
 #include <Trade/Trade.mqh>
 
@@ -26,27 +26,37 @@ enum EntrySessionMode
    SESSION_LONDON_NY  = 2  // London + New York local windows (v1.0)
 };
 
+enum StaleTradeAction
+{
+   STALE_BREAKEVEN_ELSE_CLOSE = 0, // Move SL to breakeven if in profit, otherwise close at market
+   STALE_CLOSE                = 1, // Close at market
+   STALE_BREAKEVEN_ONLY       = 2  // Move SL to breakeven once in profit, otherwise leave it
+};
+
 // Setup-funnel counters: every qualified setup is counted once, then either
 // attributed to the first gate that blocked it or counted as placed.
 #define FUNNEL_SIGNAL_T1      0
 #define FUNNEL_SIGNAL_T2      1
 #define FUNNEL_HALT           2
-#define FUNNEL_EXPOSURE       3
-#define FUNNEL_SESSION        4
-#define FUNNEL_MARKET_CLOSE   5
-#define FUNNEL_SPREAD         6
-#define FUNNEL_SHOCK          7
-#define FUNNEL_RUNAWAY        8
-#define FUNNEL_NEWS           9
-#define FUNNEL_CHASE          10
-#define FUNNEL_NO_SWING       11
-#define FUNNEL_STOP_TOO_WIDE  12
-#define FUNNEL_OTHER          13
-#define FUNNEL_PLACED         14
-#define FUNNEL_SIZE           15
+#define FUNNEL_COOLDOWN       3
+#define FUNNEL_EXPOSURE       4
+#define FUNNEL_SESSION        5
+#define FUNNEL_MARKET_CLOSE   6
+#define FUNNEL_SPREAD         7
+#define FUNNEL_SHOCK          8
+#define FUNNEL_RUNAWAY        9
+#define FUNNEL_NEWS           10
+#define FUNNEL_CHASE          11
+#define FUNNEL_NO_SWING       12
+#define FUNNEL_STOP_TOO_WIDE  13
+#define FUNNEL_RISK_BUDGET    14
+#define FUNNEL_MARGIN         15
+#define FUNNEL_OTHER          16
+#define FUNNEL_PLACED         17
+#define FUNNEL_SIZE           18
 
 input group "Identity and account safety"
-input ulong  InpMagicNumber                  = 26092812;
+input ulong  InpMagicNumber                  = 26092813;
 input bool   InpRequireGBPAccount             = true;
 input double InpFixedLots                     = 0.02;
 input double InpMinimumProjectedMarginLevel   = 120.0;
@@ -77,7 +87,7 @@ input double InpTier2RsiShortThreshold        = 85.0;
 input group "Entry, stop and target"
 input double InpEntryBufferPrice              = 0.05;
 input double InpMaxEntryAdjustmentPrice       = 0.20;
-input int    InpPendingExpiryBars             = 2;
+input int    InpPendingExpiryBars             = 3;
 input int    InpSwingLookbackBars             = 12;
 input double InpSwingAtrBuffer                = 0.15;
 // Stop always beyond both signal candles (false = v1.1 swing search)
@@ -96,6 +106,19 @@ input double InpMinimumTargetPrice            = 6.00;
 input double InpMaximumTargetPrice            = 9.80;
 input int    InpMaximumDeviationPoints        = 20;
 
+input group "Position capacity"
+// EA positions allowed at once on this symbol (hedging accounts only; netting accounts use 1)
+input int    InpMaxConcurrentPositions        = 2;
+// Skip an additional position if every open EA position plus the new one stopping out would breach the daily loss limit
+input bool   InpWorstCaseDailyLossCheck       = true;
+
+input group "Stale-trade release"
+// M5 bars after the fill before the rule acts (36 = 3 hours); 0 = off
+input int    InpStaleTradeBars                = 36;
+input StaleTradeAction InpStaleTradeAction    = STALE_BREAKEVEN_ELSE_CLOSE;
+// Breakeven stop is placed this far beyond the entry price (covers commission and spread)
+input double InpBreakevenOffsetPrice          = 0.10;
+
 input group "Sessions"
 input EntrySessionMode InpSessionMode         = SESSION_24X5;
 // Used only by SESSION_UTC_WINDOW
@@ -113,6 +136,8 @@ input group "Market-close protection (broker session table)"
 input int    InpNoEntryMinutesBeforeDailyClose  = 15;
 // 0 = off. Same, before the last session of the week
 input int    InpNoEntryMinutesBeforeWeeklyClose = 60;
+// Close all EA positions this many minutes before the weekly close (weekend-gap protection); 0 = off
+input int    InpCloseMinutesBeforeWeeklyClose   = 15;
 
 input group "Abnormal-condition filters"
 input double InpMaximumSpreadPrice            = 0.30;
@@ -131,6 +156,8 @@ input group "Daily controls (account currency)"
 input int    InpMaximumDailyEntries           = 10;
 input int    InpMaximumDailyLosses            = 2;
 input DailyLossCountMode InpDailyLossCountMode = LOSS_COUNT_CONSECUTIVE;
+// Pause new entries for this many hours after the consecutive-loss limit; 0 = halt for the rest of the day (v1.2)
+input int    InpCooldownHoursAfterHalt        = 2;
 input double InpMaximumDailyDrawdown          = 14.0;
 
 int      g_m5EmaHandle       = INVALID_HANDLE;
@@ -143,13 +170,25 @@ datetime g_lastM5BarTime     = 0;
 datetime g_dailyStart        = 0;
 int      g_dailyEntries      = 0;
 int      g_dailyLosses       = 0;     // total losing positions today
-int      g_dailyConsecLosses = 0;     // current consecutive losing streak today
+int      g_dailyConsecLosses = 0;     // current consecutive losing streak today (resets after a cooldown)
 int      g_lastSignalTier    = 0;
 double   g_dailyNet          = 0.0;
 bool     g_dailyHalted       = false;
 string   g_status            = "Initializing";
 int      g_funnel[FUNNEL_SIZE];       // setup funnel for the end-of-run report
 datetime g_runStart          = 0;
+int      g_maxPositions      = 1;     // effective concurrent-position limit (1 on netting accounts)
+bool     g_lossHalt          = false; // loss-count halt for the rest of the server day
+datetime g_cooldownUntil     = 0;     // end of the current loss-streak cooldown (server time)
+int      g_dailyCooldowns    = 0;     // cooldowns started today
+datetime g_lastManageTime    = 0;
+datetime g_nextCloseAttempt  = 0;
+bool     g_marginLogged      = false;
+int      g_placedAdditional  = 0;     // orders placed while another EA position was open
+int      g_eventCooldowns    = 0;
+int      g_eventWeeklyCloses = 0;
+int      g_eventStaleCloses  = 0;
+int      g_eventBreakevens   = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
@@ -210,7 +249,19 @@ int OnInit()
    Trade.SetTypeFillingBySymbol(_Symbol);
    Trade.SetAsyncMode(false);
 
+   g_maxPositions = InpMaxConcurrentPositions;
+   if(g_maxPositions > 1 &&
+      (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+   {
+      PrintFormat("Netting account: a second order would merge into the open position and replace its SL/TP. "
+                  "Concurrent positions limited to 1 (input was %d).", InpMaxConcurrentPositions);
+      g_maxPositions = 1;
+   }
+
    ArrayInitialize(g_funnel, 0);
+   g_placedAdditional = g_eventCooldowns = g_eventWeeklyCloses = g_eventStaleCloses = g_eventBreakevens = 0;
+   g_cooldownUntil = g_lastManageTime = g_nextCloseAttempt = 0;
+   g_marginLogged = false;
    g_runStart = TimeCurrent();
    g_lastM5BarTime = iTime(_Symbol, PERIOD_M5, 0);
    RefreshDailyStats();
@@ -241,10 +292,16 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    RefreshDailyStatsIfNeeded();
+   if(!g_marginLogged)
+      LogMarginCapacity();
+
+   ManageOpenPositions();
 
    string close_reason = "";
    if(g_dailyHalted)
       CancelOwnPendingOrders("daily halt");
+   else if(IsInCooldown())
+      CancelOwnPendingOrders("loss-streak cooldown");
    else if(OrdersTotal() > 0 && IsNearMarketClose(close_reason))
       CancelOwnPendingOrders("market-close protection");
    else
@@ -296,7 +353,11 @@ bool InputsAreValid()
    if(InpUtcSessionStartHour < 0 || InpUtcSessionStartHour > 23 || InpUtcSessionEndHour < 1 ||
       InpUtcSessionEndHour > 24 || InpUtcSessionStartHour >= InpUtcSessionEndHour)
       valid = false;
-   if(InpNoEntryMinutesBeforeDailyClose < 0 || InpNoEntryMinutesBeforeWeeklyClose < 0)
+   if(InpNoEntryMinutesBeforeDailyClose < 0 || InpNoEntryMinutesBeforeWeeklyClose < 0 ||
+      InpCloseMinutesBeforeWeeklyClose < 0)
+      valid = false;
+   if(InpMaxConcurrentPositions < 1 || InpMaxConcurrentPositions > 3 || InpCooldownHoursAfterHalt < 0 ||
+      InpCooldownHoursAfterHalt > 24 || InpStaleTradeBars < 0 || InpBreakevenOffsetPrice < 0.0)
       valid = false;
    if(InpPendingExpiryBars < 1 || InpSwingLookbackBars < 3 || InpAtrMedianLookbackBars < 10 ||
       InpNormalBarsAfterShock < 1)
@@ -351,8 +412,14 @@ void EvaluateNewM5Bar()
    RefreshDailyStats();
    CancelExpiredOwnPendingOrders();
 
-   if(g_dailyHalted)
-      CancelOwnPendingOrders("daily halt");
+   bool cooling_down = IsInCooldown();
+   if(g_dailyHalted || cooling_down)
+      CancelOwnPendingOrders(g_dailyHalted ? "daily halt" : "loss-streak cooldown");
+
+   int  own_positions    = 0;
+   int  own_direction    = 0;
+   bool foreign_exposure = false;
+   ScanSymbolExposure(own_positions, own_direction, foreign_exposure);
 
    // Setup-independent gates, evaluated first so the dashboard keeps showing why the EA is idle.
    int    gate_stage   = -1;
@@ -363,15 +430,25 @@ void EvaluateNewM5Bar()
       gate_stage  = FUNNEL_HALT;
       gate_status = DailyHaltDescription();
    }
-   else if(HasAnyPositionForSymbol())
+   else if(cooling_down)
+   {
+      gate_stage  = FUNNEL_COOLDOWN;
+      gate_status = CooldownDescription();
+   }
+   else if(foreign_exposure)
    {
       gate_stage  = FUNNEL_EXPOSURE;
-      gate_status = "Existing symbol position; no overlapping exposure";
+      gate_status = "Manual or other-EA position/order on this symbol; EA entries paused";
    }
    else if(HasAnyPendingOrderForSymbol())
    {
       gate_stage  = FUNNEL_EXPOSURE;
       gate_status = "Existing symbol pending order; waiting for resolution";
+   }
+   else if(own_positions >= g_maxPositions)
+   {
+      gate_stage  = FUNNEL_EXPOSURE;
+      gate_status = StringFormat("%d of %d EA positions open; no further exposure", own_positions, g_maxPositions);
    }
    else if(!IsEntrySession())
    {
@@ -413,6 +490,13 @@ void EvaluateNewM5Bar()
       return;
    }
 
+   // An additional position must be in the same direction as the EA's open position(s).
+   if(own_positions > 0 && (int)signal != own_direction)
+   {
+      BlockSetup(FUNNEL_EXPOSURE, "Opposite-direction setup while an EA position is open");
+      return;
+   }
+
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0.0 || tick.bid <= 0.0)
    {
@@ -446,8 +530,12 @@ void EvaluateNewM5Bar()
    }
 
    g_lastSignalTier = tier;
-   int stage = PlaceProtectedPendingOrder(signal, tier, rates, atr, CurrentMaximumStopPrice(m15_atr), tick);
+   bool additional = (own_positions > 0);
+   int stage = PlaceProtectedPendingOrder(signal, tier, additional, rates, atr,
+                                          CurrentMaximumStopPrice(m15_atr), tick);
    g_funnel[stage]++;
+   if(stage == FUNNEL_PLACED && additional)
+      g_placedAdditional++;
 }
 
 void BlockSetup(const int stage, const string status)
@@ -603,8 +691,9 @@ SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const 
 //+------------------------------------------------------------------+
 //| Place a broker-side protected stop entry                         |
 //+------------------------------------------------------------------+
-int PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, const MqlRates &rates[],
-                               const double &atr[], const double maximum_stop, const MqlTick &tick)
+int PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, const bool additional_position,
+                               const MqlRates &rates[], const double &atr[], const double maximum_stop,
+                               const MqlTick &tick)
 {
    ENUM_SYMBOL_TRADE_MODE trade_mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if((signal == SIGNAL_LONG && trade_mode == SYMBOL_TRADE_MODE_SHORTONLY) ||
@@ -720,8 +809,24 @@ int PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, con
       return FUNNEL_OTHER;
    }
 
+   if(additional_position && InpWorstCaseDailyLossCheck)
+   {
+      double worst_case = 0.0;
+      if(!WorstCaseDailyNet(signal, entry, stop_loss, worst_case))
+      {
+         SetStatus("Worst-case daily loss unavailable; additional position skipped");
+         return FUNNEL_RISK_BUDGET;
+      }
+      if(worst_case <= -InpMaximumDailyDrawdown)
+      {
+         SetStatus(StringFormat("Additional position skipped: if every stop is hit, today's net would be %.2f (limit -%.2f)",
+                                worst_case, InpMaximumDailyDrawdown));
+         return FUNNEL_RISK_BUDGET;
+      }
+   }
+
    if(!HasSufficientMargin(signal, entry))
-      return FUNNEL_OTHER;
+      return FUNNEL_MARGIN;
 
    ENUM_ORDER_TYPE_TIME order_time = ORDER_TIME_GTC;
    datetime expiration = 0;
@@ -732,7 +837,7 @@ int PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, con
       expiration = iTime(_Symbol, PERIOD_M5, 0) + InpPendingExpiryBars * PeriodSeconds(PERIOD_M5);
    }
 
-   string comment = StringFormat("AegisGold-v1.2-T%d-%s", tier, SessionTag());
+   string comment = StringFormat("AegisGold-v1.3-T%d-%s%s", tier, SessionTag(), additional_position ? "-P2" : "");
    bool request_ok = false;
    if(signal == SIGNAL_LONG)
       request_ok = Trade.BuyStop(InpFixedLots, entry, _Symbol, stop_loss, take_profit,
@@ -1002,7 +1107,9 @@ datetime ServerNow()
 //+------------------------------------------------------------------+
 bool IsNearMarketClose(string &reason)
 {
-   if(InpNoEntryMinutesBeforeDailyClose <= 0 && InpNoEntryMinutesBeforeWeeklyClose <= 0)
+   // No new entries while (or just before) positions are being closed for the weekend.
+   int weekly_limit = MathMax(InpNoEntryMinutesBeforeWeeklyClose, InpCloseMinutesBeforeWeeklyClose);
+   if(InpNoEntryMinutesBeforeDailyClose <= 0 && weekly_limit <= 0)
       return false;
 
    bool weekly_close = false;
@@ -1010,7 +1117,7 @@ bool IsNearMarketClose(string &reason)
    if(seconds_left < 0)
       return false;
 
-   int limit_minutes = weekly_close ? InpNoEntryMinutesBeforeWeeklyClose : InpNoEntryMinutesBeforeDailyClose;
+   int limit_minutes = weekly_close ? weekly_limit : InpNoEntryMinutesBeforeDailyClose;
    if(limit_minutes <= 0 || seconds_left > (long)limit_minutes * 60)
       return false;
 
@@ -1258,12 +1365,15 @@ void RefreshDailyStats()
       }
    }
 
-   int current_streak = 0;
-   int max_streak = 0;
+   int      current_streak = 0;
+   bool     loss_halt      = false;
+   datetime cooldown_until = 0;
+   int      cooldowns      = 0;
    for(int position_index = 0; position_index < ArraySize(closed_position_ids); position_index++)
    {
-      double position_net = 0.0;
-      bool has_exit = false;
+      double   position_net = 0.0;
+      bool     has_exit     = false;
+      datetime exit_time    = 0;
       for(int deal_index = 0; deal_index < deals_total; deal_index++)
       {
          ulong deal_ticket = HistoryDealGetTicket(deal_index);
@@ -1276,35 +1386,64 @@ void RefreshDailyStats()
          position_net += DealNetResult(deal_ticket);
          ENUM_DEAL_ENTRY entry_type = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
          if(entry_type == DEAL_ENTRY_OUT || entry_type == DEAL_ENTRY_OUT_BY || entry_type == DEAL_ENTRY_INOUT)
+         {
             has_exit = true;
+            datetime deal_time = (datetime)HistoryDealGetInteger(deal_ticket, DEAL_TIME);
+            if(deal_time > exit_time)
+               exit_time = deal_time;
+         }
       }
-      // closed_position_ids is in chronological exit order (history deals are time-ordered
-      // and the EA holds one position at a time), so a running streak is well defined.
+      // closed_position_ids follows the order of each position's exit deal (history deals are
+      // time-ordered), so the running streak follows the order in which positions closed.
       if(!has_exit)
          continue;
-      if(position_net < 0.0)
+      if(position_net >= 0.0)
       {
-         g_dailyLosses++;
-         current_streak++;
-         if(current_streak > max_streak)
-            max_streak = current_streak;
-      }
-      else
          current_streak = 0;
+         continue;
+      }
+
+      g_dailyLosses++;
+      current_streak++;
+      if(InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE && current_streak >= InpMaximumDailyLosses)
+      {
+         if(InpCooldownHoursAfterHalt > 0)
+         {
+            // Pause instead of halting; the streak restarts after each cooldown.
+            cooldown_until = exit_time + InpCooldownHoursAfterHalt * 3600;
+            cooldowns++;
+            current_streak = 0;
+         }
+         else
+            loss_halt = true;   // v1.2 behaviour: halted until the next server day
+      }
    }
 
-   // Halt is sticky for the day: once N consecutive losses occurred, stop until next server day.
-   g_dailyConsecLosses = max_streak;
-   int counted_losses = (InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE) ? max_streak : g_dailyLosses;
+   if(InpDailyLossCountMode == LOSS_COUNT_TOTAL && g_dailyLosses >= InpMaximumDailyLosses)
+      loss_halt = true;
+
+   // Counters reset at server midnight, so a cooldown never runs past the day rollover.
+   if(cooldown_until > g_cooldownUntil)
+      g_eventCooldowns++;
+   g_cooldownUntil     = cooldown_until;
+   g_dailyCooldowns    = cooldowns;
+   g_dailyConsecLosses = current_streak;
+   g_lossHalt          = loss_halt;
 
    g_dailyHalted = (g_dailyEntries >= InpMaximumDailyEntries ||
-                    counted_losses >= InpMaximumDailyLosses ||
+                    g_lossHalt ||
                     g_dailyNet <= -InpMaximumDailyDrawdown);
 }
 
-int CountedDailyLosses()
+bool IsInCooldown()
 {
-   return (InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE) ? g_dailyConsecLosses : g_dailyLosses;
+   return (g_cooldownUntil > 0 && ServerNow() < g_cooldownUntil);
+}
+
+string CooldownDescription()
+{
+   return StringFormat("Cooldown after %d consecutive losses until %s server time",
+                       InpMaximumDailyLosses, TimeToString(g_cooldownUntil, TIME_MINUTES));
 }
 
 double DealNetResult(const ulong deal_ticket)
@@ -1335,9 +1474,10 @@ datetime StartOfDay(const datetime value)
 
 string DailyHaltDescription()
 {
-   if(CountedDailyLosses() >= InpMaximumDailyLosses)
-      return StringFormat("Daily halt: %d %s losses", CountedDailyLosses(),
-                          InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE ? "consecutive" : "total");
+   if(g_lossHalt)
+      return (InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE)
+             ? StringFormat("Daily halt: %d consecutive losses", InpMaximumDailyLosses)
+             : StringFormat("Daily halt: %d losses in total", g_dailyLosses);
    if(g_dailyNet <= -InpMaximumDailyDrawdown)
       return StringFormat("Daily halt: net P/L %.2f", g_dailyNet);
    if(g_dailyEntries >= InpMaximumDailyEntries)
@@ -1348,15 +1488,209 @@ string DailyHaltDescription()
 //+------------------------------------------------------------------+
 //| Exposure and pending-order helpers                               |
 //+------------------------------------------------------------------+
-bool HasAnyPositionForSymbol()
+//| Count this EA's positions on the symbol and their direction      |
+//| (+1 long, -1 short, 0 none or mixed). Manual or other-EA          |
+//| positions and orders on the symbol are reported as foreign.       |
+void ScanSymbolExposure(int &own_positions, int &own_direction, bool &foreign_exposure)
 {
-   for(int index = 0; index < PositionsTotal(); index++)
+   own_positions    = 0;
+   own_direction    = 0;
+   foreign_exposure = false;
+   bool has_long  = false;
+   bool has_short = false;
+
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
    {
       ulong ticket = PositionGetTicket(index);
-      if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
-         return true;
+      if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+      {
+         foreign_exposure = true;
+         continue;
+      }
+      own_positions++;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         has_long = true;
+      else
+         has_short = true;
    }
-   return false;
+
+   for(int index = OrdersTotal() - 1; index >= 0; index--)
+   {
+      ulong ticket = OrderGetTicket(index);
+      if(ticket > 0 && OrderGetString(ORDER_SYMBOL) == _Symbol &&
+         (ulong)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)
+         foreign_exposure = true;
+   }
+
+   if(has_long && !has_short)
+      own_direction = 1;
+   else if(has_short && !has_long)
+      own_direction = -1;
+}
+
+//+------------------------------------------------------------------+
+//| Today's net if the new order and every open EA position hit      |
+//| their stops (account currency). Fails if a stop is missing.      |
+//+------------------------------------------------------------------+
+bool WorstCaseDailyNet(const SignalDirection signal, const double entry, const double stop_loss,
+                       double &worst_case)
+{
+   worst_case = g_dailyNet;
+
+   double new_loss = 0.0;
+   ENUM_ORDER_TYPE new_type = (signal == SIGNAL_LONG) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   if(!OrderCalcProfit(new_type, _Symbol, InpFixedLots, entry, stop_loss, new_loss))
+      return false;
+   worst_case += MathMin(0.0, new_loss);
+
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
+   {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         (ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      double position_stop = PositionGetDouble(POSITION_SL);
+      if(position_stop <= 0.0)
+         return false;
+
+      ENUM_ORDER_TYPE position_type =
+         ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      double position_loss = 0.0;
+      if(!OrderCalcProfit(position_type, _Symbol, PositionGetDouble(POSITION_VOLUME),
+                          PositionGetDouble(POSITION_PRICE_OPEN), position_stop, position_loss))
+         return false;
+      worst_case += MathMin(0.0, position_loss) + MathMin(0.0, PositionGetDouble(POSITION_SWAP));
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Position management, at most once per second:                    |
+//| 1. close every EA position shortly before the weekly close;      |
+//| 2. stale-trade release after InpStaleTradeBars M5 bars.          |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   if(PositionsTotal() == 0 || (InpCloseMinutesBeforeWeeklyClose <= 0 && InpStaleTradeBars <= 0))
+      return;
+
+   datetime now = TimeCurrent();
+   if(now == g_lastManageTime || now < g_nextCloseAttempt)
+      return;
+   g_lastManageTime = now;
+
+   bool flatten = WeeklyFlattenDue();
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
+   {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol ||
+         (ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
+      if(flatten)
+      {
+         if(ClosePositionWithReason(ticket, "weekly-close protection"))
+            g_eventWeeklyCloses++;
+         continue;
+      }
+      ApplyStaleTradeRule(ticket, now);
+   }
+}
+
+bool WeeklyFlattenDue()
+{
+   if(InpCloseMinutesBeforeWeeklyClose <= 0)
+      return false;
+
+   datetime server_time = ServerNow();
+   bool weekly_close = false;
+   long seconds_left = SecondsToSessionClose(server_time, weekly_close);
+   if(!weekly_close || seconds_left < 0 || seconds_left > (long)InpCloseMinutesBeforeWeeklyClose * 60)
+      return false;
+
+   // With a published session table, act only while the market is open (orders fail otherwise).
+   MqlDateTime parts;
+   TimeToStruct(server_time, parts);
+   long now_seconds = (long)parts.hour * 3600 + (long)parts.min * 60 + (long)parts.sec;
+   long session_end = 0;
+   if(DayHasTradeSession(parts.day_of_week) && !FindSessionEnd(parts.day_of_week, now_seconds, session_end))
+      return false;
+   return true;
+}
+
+void ApplyStaleTradeRule(const ulong ticket, const datetime now)
+{
+   if(InpStaleTradeBars <= 0 || !PositionSelectByTicket(ticket))
+      return;
+
+   long held_seconds = (long)now - (long)PositionGetInteger(POSITION_TIME);
+   if(held_seconds < (long)InpStaleTradeBars * PeriodSeconds(PERIOD_M5))
+      return;
+
+   bool   is_long     = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+   double open_price  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double stop_loss   = PositionGetDouble(POSITION_SL);
+   double take_profit = PositionGetDouble(POSITION_TP);
+   double tick_size   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double breakeven   = is_long ? RoundUpToTick(open_price + InpBreakevenOffsetPrice)
+                                : RoundDownToTick(open_price - InpBreakevenOffsetPrice);
+
+   // Stop already at breakeven or better: nothing left to do for this position.
+   if(stop_loss > 0.0 && (is_long ? stop_loss >= breakeven - tick_size * 0.5
+                                  : stop_loss <= breakeven + tick_size * 0.5))
+      return;
+
+   if(InpStaleTradeAction != STALE_CLOSE)
+   {
+      MqlTick tick;
+      if(!SymbolInfoTick(_Symbol, tick))
+         return;
+      double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double level_points = MathMax((double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL),
+                                    (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL));
+      double minimum_gap = MathMax(level_points * point, tick_size);
+      bool room = is_long ? (tick.bid - breakeven >= minimum_gap) : (breakeven - tick.ask >= minimum_gap);
+      if(room)
+      {
+         if(Trade.PositionModify(ticket, breakeven, take_profit))
+         {
+            g_eventBreakevens++;
+            PrintFormat("Stale trade %I64u after %d M5 bars: stop moved to breakeven %.3f.",
+                        ticket, InpStaleTradeBars, breakeven);
+         }
+         else
+         {
+            PrintFormat("Breakeven move failed for %I64u: %u %s; retrying in 60 s.",
+                        ticket, Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+            g_nextCloseAttempt = now + 60;
+         }
+         return;
+      }
+      if(InpStaleTradeAction == STALE_BREAKEVEN_ONLY)
+         return;
+   }
+
+   if(ClosePositionWithReason(ticket, StringFormat("stale after %d M5 bars", InpStaleTradeBars)))
+      g_eventStaleCloses++;
+}
+
+bool ClosePositionWithReason(const ulong ticket, const string reason)
+{
+   bool request_ok = Trade.PositionClose(ticket, (ulong)InpMaximumDeviationPoints);
+   uint retcode = Trade.ResultRetcode();
+   if(!request_ok || (retcode != TRADE_RETCODE_DONE && retcode != TRADE_RETCODE_DONE_PARTIAL &&
+                      retcode != TRADE_RETCODE_PLACED))
+   {
+      PrintFormat("Failed to close position %I64u (%s): %u %s; retrying in 60 s.",
+                  ticket, reason, retcode, Trade.ResultRetcodeDescription());
+      g_nextCloseAttempt = TimeCurrent() + 60;
+      return false;
+   }
+   PrintFormat("Position %I64u closed at market: %s.", ticket, reason);
+   return true;
 }
 
 bool HasAnyPendingOrderForSymbol()
@@ -1517,24 +1851,35 @@ void UpdateDashboard()
    if(SymbolInfoTick(_Symbol, tick))
       spread = tick.ask - tick.bid;
 
+   int  own_positions    = 0;
+   int  own_direction    = 0;
+   bool foreign_exposure = false;
+   ScanSymbolExposure(own_positions, own_direction, foreign_exposure);
+
+   string state = "active";
+   if(g_dailyHalted)
+      state = "HALTED for the day";
+   else if(IsInCooldown())
+      state = "COOLDOWN until " + TimeToString(g_cooldownUntil, TIME_MINUTES);
+
    string dashboard = StringFormat(
-      "Aegis Gold Trend-Pullback v1.20 (two-tier, 24/5)\n"
-      "Symbol: %s | Lots: %.2f | Spread: %.3f\n"
-      "Today: entries %d/%d | losses %d total, %d consecutive (halt at %d %s) | net %.2f %s\n"
-      "Last signal tier: %d | Halted: %s | Status: %s",
-      _Symbol, InpFixedLots, spread,
+      "Aegis Gold Trend-Pullback v1.30 (two-tier, 24/5)\n"
+      "Symbol: %s | Lots: %.2f | Spread: %.3f | EA positions: %d/%d\n"
+      "Today: entries %d/%d | losses %d, streak %d/%d, cooldowns %d | net %.2f %s\n"
+      "Last signal tier: %d | State: %s | Status: %s",
+      _Symbol, InpFixedLots, spread, own_positions, g_maxPositions,
       g_dailyEntries, InpMaximumDailyEntries,
-      g_dailyLosses, g_dailyConsecLosses, InpMaximumDailyLosses,
-      InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE ? "consecutive" : "total",
+      g_dailyLosses, g_dailyConsecLosses, InpMaximumDailyLosses, g_dailyCooldowns,
       g_dailyNet, AccountInfoString(ACCOUNT_CURRENCY),
-      g_lastSignalTier, g_dailyHalted ? "YES" : "NO", g_status);
+      g_lastSignalTier, state, g_status);
    Comment(dashboard);
 }
 
 //+------------------------------------------------------------------+
 //| End-of-run report (Strategy Tester journal / Experts log):       |
-//| setup funnel for this run, then this run's closed trades for the |
-//| magic number, split by tier and UTC session (order comment).     |
+//| setup funnel and position-management events for this run, then   |
+//| this run's closed trades split by tier, session, additional      |
+//| position, exit type and holding time.                            |
 //+------------------------------------------------------------------+
 void PrintRunSummary()
 {
@@ -1542,24 +1887,32 @@ void PrintRunSummary()
       return;
 
    int setups = g_funnel[FUNNEL_SIGNAL_T1] + g_funnel[FUNNEL_SIGNAL_T2];
-   PrintFormat("AegisGold setup funnel: %d qualified setups (T1 %d, T2 %d), orders placed %d. Blocked by: "
-               "daily halt %d, open position/order %d, session %d, market close %d, spread %d, shock %d, "
-               "runaway %d, news %d, chase %d, no swing %d, stop too wide %d, other %d",
+   PrintFormat("AegisGold setup funnel: %d qualified setups (T1 %d, T2 %d), orders placed %d (%d as an additional position). "
+               "Blocked by: daily halt %d, cooldown %d, open position/order %d, session %d, market close %d, "
+               "spread %d, shock %d, runaway %d, news %d, chase %d, no swing %d, stop too wide %d, "
+               "worst-case daily loss %d, margin %d, other %d",
                setups, g_funnel[FUNNEL_SIGNAL_T1], g_funnel[FUNNEL_SIGNAL_T2], g_funnel[FUNNEL_PLACED],
-               g_funnel[FUNNEL_HALT], g_funnel[FUNNEL_EXPOSURE], g_funnel[FUNNEL_SESSION],
-               g_funnel[FUNNEL_MARKET_CLOSE], g_funnel[FUNNEL_SPREAD], g_funnel[FUNNEL_SHOCK],
-               g_funnel[FUNNEL_RUNAWAY], g_funnel[FUNNEL_NEWS], g_funnel[FUNNEL_CHASE],
-               g_funnel[FUNNEL_NO_SWING], g_funnel[FUNNEL_STOP_TOO_WIDE], g_funnel[FUNNEL_OTHER]);
+               g_placedAdditional, g_funnel[FUNNEL_HALT], g_funnel[FUNNEL_COOLDOWN], g_funnel[FUNNEL_EXPOSURE],
+               g_funnel[FUNNEL_SESSION], g_funnel[FUNNEL_MARKET_CLOSE], g_funnel[FUNNEL_SPREAD],
+               g_funnel[FUNNEL_SHOCK], g_funnel[FUNNEL_RUNAWAY], g_funnel[FUNNEL_NEWS], g_funnel[FUNNEL_CHASE],
+               g_funnel[FUNNEL_NO_SWING], g_funnel[FUNNEL_STOP_TOO_WIDE], g_funnel[FUNNEL_RISK_BUDGET],
+               g_funnel[FUNNEL_MARGIN], g_funnel[FUNNEL_OTHER]);
+   PrintFormat("AegisGold position management: %d cooldowns, %d weekly-close exits, %d stale-trade closes, "
+               "%d breakeven moves",
+               g_eventCooldowns, g_eventWeeklyCloses, g_eventStaleCloses, g_eventBreakevens);
 
    datetime now = TimeCurrent();
    if(!HistorySelect(g_runStart, now + 60))
       return;
 
    // Aggregate every deal of this EA by position ID.
-   ulong  position_ids[];
-   double position_net[];
-   ulong  entry_orders[];
-   bool   position_closed[];
+   ulong    position_ids[];
+   double   position_net[];
+   ulong    entry_orders[];
+   bool     position_closed[];
+   datetime entry_times[];
+   datetime exit_times[];
+   int      exit_types[];   // 0 other, 1 stop loss, 2 take profit, 3 closed by the EA
    int deals_total = HistoryDealsTotal();
    for(int index = 0; index < deals_total; index++)
    {
@@ -1586,18 +1939,34 @@ void PrintRunSummary()
          ArrayResize(position_net, slot + 1);
          ArrayResize(entry_orders, slot + 1);
          ArrayResize(position_closed, slot + 1);
-         position_ids[slot] = position_id;
-         position_net[slot] = 0.0;
-         entry_orders[slot] = 0;
+         ArrayResize(entry_times, slot + 1);
+         ArrayResize(exit_times, slot + 1);
+         ArrayResize(exit_types, slot + 1);
+         position_ids[slot]    = position_id;
+         position_net[slot]    = 0.0;
+         entry_orders[slot]    = 0;
          position_closed[slot] = false;
+         entry_times[slot]     = 0;
+         exit_times[slot]      = 0;
+         exit_types[slot]      = 0;
       }
 
       position_net[slot] += DealNetResult(deal_ticket);
+      datetime deal_time = (datetime)HistoryDealGetInteger(deal_ticket, DEAL_TIME);
       ENUM_DEAL_ENTRY entry_type = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
       if(entry_type == DEAL_ENTRY_IN && entry_orders[slot] == 0)
+      {
          entry_orders[slot] = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_ORDER);
+         entry_times[slot]  = deal_time;
+      }
       if(entry_type == DEAL_ENTRY_OUT || entry_type == DEAL_ENTRY_OUT_BY || entry_type == DEAL_ENTRY_INOUT)
+      {
          position_closed[slot] = true;
+         exit_times[slot] = deal_time;
+         ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
+         exit_types[slot] = (reason == DEAL_REASON_SL) ? 1 :
+                            ((reason == DEAL_REASON_TP) ? 2 : ((reason == DEAL_REASON_EXPERT) ? 3 : 0));
+      }
    }
 
    // Index 0 = untagged/unknown; tiers 1-2; sessions ASIA, LON, NY, LATE.
@@ -1608,6 +1977,14 @@ void PrintRunSummary()
    int    session_trades[5] = {0, 0, 0, 0, 0};
    int    session_wins[5]   = {0, 0, 0, 0, 0};
    double session_net[5]    = {0.0, 0.0, 0.0, 0.0, 0.0};
+   int    exit_counts[4]    = {0, 0, 0, 0};
+   double exit_net[4]       = {0.0, 0.0, 0.0, 0.0};
+   int    additional_trades = 0;
+   int    additional_wins   = 0;
+   double additional_net    = 0.0;
+   int    timed_trades      = 0;
+   double total_minutes     = 0.0;
+   double longest_minutes   = 0.0;
    int    trades = 0;
    int    wins = 0;
    double net_total = 0.0;
@@ -1641,6 +2018,23 @@ void PrintRunSummary()
       tier_net[tier_index] += position_net[slot];
       session_trades[session_index]++;
       session_net[session_index] += position_net[slot];
+      exit_counts[exit_types[slot]]++;
+      exit_net[exit_types[slot]] += position_net[slot];
+      if(StringFind(comment, "-P2") >= 0)
+      {
+         additional_trades++;
+         additional_net += position_net[slot];
+         if(win)
+            additional_wins++;
+      }
+      if(entry_times[slot] > 0 && exit_times[slot] >= entry_times[slot])
+      {
+         double minutes = (double)((long)exit_times[slot] - (long)entry_times[slot]) / 60.0;
+         timed_trades++;
+         total_minutes += minutes;
+         if(minutes > longest_minutes)
+            longest_minutes = minutes;
+      }
       if(win)
       {
          wins++;
@@ -1650,7 +2044,7 @@ void PrintRunSummary()
    }
 
    int weekdays = 0;
-   if(g_runStart > 0 && now > g_runStart)
+   if(now > g_runStart)
    {
       for(datetime day = StartOfDay(g_runStart); day <= now; day += 86400)
       {
@@ -1679,6 +2073,34 @@ void PrintRunSummary()
                   100.0 * session_wins[session_index] / session_trades[session_index],
                   session_net[session_index]);
    }
+   PrintFormat("AegisGold   Additional positions: %d trades, %d wins (%.1f%%), net %.2f",
+               additional_trades, additional_wins,
+               additional_trades > 0 ? 100.0 * additional_wins / additional_trades : 0.0, additional_net);
+   PrintFormat("AegisGold   Exits: take profit %d (net %.2f), stop loss incl. breakeven %d (net %.2f), "
+               "closed by EA %d (net %.2f), other %d (net %.2f)",
+               exit_counts[2], exit_net[2], exit_counts[1], exit_net[1], exit_counts[3], exit_net[3],
+               exit_counts[0], exit_net[0]);
+   PrintFormat("AegisGold   Holding time: average %.0f min, longest %.0f min",
+               timed_trades > 0 ? total_minutes / timed_trades : 0.0, longest_minutes);
+}
+
+//+------------------------------------------------------------------+
+//| Margin capacity, logged once a live price is available           |
+//+------------------------------------------------------------------+
+void LogMarginCapacity()
+{
+   MqlTick tick;
+   double margin = 0.0;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.ask <= 0.0 ||
+      !OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, InpFixedLots, tick.ask, margin) || margin <= 0.0)
+      return;
+
+   g_marginLogged = true;
+   double gate = InpMinimumProjectedMarginLevel / 100.0;
+   PrintFormat("AegisGold margin: %.2f lot at %.2f needs %.2f %s. At the %.0f%% margin-level gate, one position "
+               "needs equity >= %.2f and %d positions need >= %.2f; equity now %.2f.",
+               InpFixedLots, tick.ask, margin, AccountInfoString(ACCOUNT_CURRENCY), InpMinimumProjectedMarginLevel,
+               margin * gate, g_maxPositions, margin * g_maxPositions * gate, AccountInfoDouble(ACCOUNT_EQUITY));
 }
 
 void LogSymbolConfiguration()

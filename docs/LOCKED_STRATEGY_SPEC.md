@@ -1,6 +1,42 @@
-# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.2
+# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.3
 
 ## 0. Change log
+
+### v1.3 (from v1.2)
+
+| Area | v1.2 | v1.3 default |
+|---|---|---|
+| Concurrent positions | One | Up to two EA positions, same direction, hedging accounts only (`InpMaxConcurrentPositions`); still one pending order at a time |
+| Additional-position risk | — | Skipped if today's net plus every open EA stop and the new stop would reach the −£14 limit (`InpWorstCaseDailyLossCheck`) |
+| Consecutive-loss limit | Halt for the rest of the day | 2-hour cooldown, then resume; the streak restarts (`InpCooldownHoursAfterHalt`, 0 = v1.2) |
+| Pending expiry | 2 M5 bars | 3 M5 bars |
+| Stale trades | — | After 36 M5 bars (3 h): stop to breakeven + $0.10 if in profit, otherwise close at market (`InpStaleTradeBars`, 0 = off) |
+| Weekend | No new entries in the last 60 min | Also closes every EA position 15 min before the weekly close (`InpCloseMinutesBeforeWeeklyClose`, 0 = off) |
+| Reporting | Funnel, tier, session | Adds cooldown, margin and worst-case-loss funnel stages; position-management counts; additional-position, exit-type and holding-time results; margin capacity logged at start |
+| Magic number | 26092812 | 26092813 |
+
+v1.2 behaviour: `InpMaxConcurrentPositions=1`, `InpCooldownHoursAfterHalt=0`, `InpPendingExpiryBars=2`, `InpStaleTradeBars=0`, `InpCloseMinutesBeforeWeeklyClose=0`.
+
+#### v1.3 calibration evidence (approximate)
+
+Same offline replica and data as the v1.2 evidence below (Binance XAUUSDT 1-minute, 28 Jun – 28 Sep 2026). It does not model margin, so every second position it takes assumes enough equity for two. Relative comparisons only.
+
+| Replica run | Trades/day | Net (GBP) | Max DD (GBP) | Worst day (GBP) |
+|---|---:|---:|---:|---:|
+| v1.2 | 2.74 | −77 | 172 | −52 |
+| v1.2 + weekly close (W) | 2.78 | +6 | 88 | −19 |
+| W + two positions with worst-case check | 2.94 | +41 | 98 | −19 |
+| W + 2 h cooldown | 3.28 | −76 | 135 | −22 |
+| W + expiry 3 bars | 2.77 | −33 | 100 | −19 |
+| W + stale rule at 36 bars | 2.78 | +4 | 90 | −19 |
+| v1.3 defaults (all of the above) | 3.51 | −125 | 179 | −23 |
+| v1.3 defaults with one position | 3.29 | −126 | 163 | −22 |
+
+- The −£52 day in v1.2 was a single short entered Friday 22:50 server time that gapped $35 through its $4 stop at Monday's open. Closing before the weekend removed it.
+- In the cooldown run, the 32 trades taken after a day's first two-loss streak won 28% and lost £81 net; days ending at or below −£14 rose from 12 to 24.
+- A longer expiry did not add trades: an order that waits longer blocks the next setup, and the late fills did worse.
+- After weekend holds are removed, few trades last 3 hours (median holding time about 20 minutes), so the stale rule rarely acts.
+- A 0.02-lot position needs about £300–£350 margin at 1:20 (gold $4,000–$4,650). Two positions need equity of about £740–£840 to pass the 120% margin-level gate, so a £400 account at 1:20 cannot hold the second position; the EA's margin gate blocks it.
 
 ### v1.2 (from v1.1)
 
@@ -36,7 +72,7 @@ In the v1.2 replica, the daily loss breaker blocked the most setups (151), follo
 
 ## 1. Status and calibration boundary
 
-This document locks the third implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
+This document locks the fourth implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
 
 Pepperstone UK currently advertises Razor XAU/USD spreads from 0.08, GBP commission of £4.50 per lot round-trip, and retail gold leverage of 1:20. At 0.02 lot, the advertised commission implies £0.09 round-trip before spread and slippage. The EA reads the actual MT5 symbol properties at runtime and does not assume a particular number of digits, tick size, contract size, minimum stop level, or margin requirement.
 
@@ -58,16 +94,16 @@ Content sourced from external documentation has been rephrased for licensing com
 | Instrument | The Pepperstone chart symbol containing `XAU` (supports broker suffixes) |
 | Account currency | GBP by default; initialization fails when strict GBP validation is enabled and the account differs |
 | Volume | Fixed 0.02 lot |
-| Concurrent exposure | One position or pending entry on the symbol |
+| Concurrent exposure | Up to two EA positions in the same direction (hedging accounts; one on netting accounts) plus at most one pending entry; any manual or other-EA position or order on the symbol blocks new entries |
 | Entry timeframe | M5, evaluated once per newly opened M5 bar using closed candles only |
 | Regime timeframe | M15, using closed candles only |
 | Initial SL distance | $4.00 minimum; adaptive maximum `clamp(1.5 × M15 ATR14, $5.00, $7.00)` in XAU/USD price units |
 | TP distance | `clamp(1.4 × actual SL distance, $6.00, $9.80)` |
 | Daily entry cap | Ten filled entries per MT5 trade-server calendar day |
-| Daily hard halt | Two consecutive losing completed positions or net strategy P/L at or below -£14 |
+| Daily hard halt | Net strategy P/L at or below -£14, or ten entries; two consecutive losing positions start a 2-hour cooldown instead |
 | Position sizing escalation | Prohibited |
 
-A daily halt cancels the EA's unfilled pending entry and prevents new entries until the next trade-server day. It does not force-close a protected open position.
+A daily halt cancels the EA's unfilled pending entry and prevents new entries until the next trade-server day; a cooldown does the same until it ends. Neither force-closes a protected open position.
 
 ## 3. Indicator definitions
 
@@ -139,7 +175,19 @@ Tier 1 (shallow pullback) — evaluated only when Tier 2 does not qualify:
 - Exhaustion RSI(2) ≤ 35.
 - Confirmation closes back above its EMA20 basis (`InpTier1RequireBasisReclaim`).
 
-Place a buy-stop at the confirmation high plus $0.05. Both tiers use identical sizing, SL, and TP rules; the order comment records the tier and UTC session (e.g. `AegisGold-v1.2-T1-ASIA`; sessions ASIA 21–07, LON 07–12, NY 12–17, LATE 17–21 UTC) so results can be split per tier and session.
+Place a buy-stop at the confirmation high plus $0.05. Both tiers use identical sizing, SL, and TP rules; the order comment records the tier and UTC session (e.g. `AegisGold-v1.3-T1-ASIA`; sessions ASIA 21–07, LON 07–12, NY 12–17, LATE 17–21 UTC), plus `-P2` when the order is an additional position, so results can be split per tier, session and position slot.
+
+### 4.1a Additional position
+
+While one EA position is open, a new setup may add a second 0.02-lot position when all of the following hold:
+
+- the account uses hedging mode (on a netting account the order would merge into the open position and replace its SL/TP, so the EA limits itself to one position);
+- the setup is in the same direction as the open position;
+- no pending order and no manual or other-EA exposure exists on the symbol;
+- today's net P/L plus the loss at every open EA position's stop plus the new order's stop loss stays above -£14 (`InpWorstCaseDailyLossCheck`); and
+- the margin gate in 7.5 passes.
+
+The additional position has its own structural SL and TP, calculated exactly as for the first.
 
 ### 4.2 Short setup
 
@@ -150,7 +198,7 @@ Exact mirror: M15 short regime; bearish confirmation closing at or below its mid
 - The broker-side pending order includes SL and TP from creation.
 - The requested entry must be adjusted when necessary to satisfy the broker's minimum stop distance.
 - Reject the setup if that adjustment would worsen entry by more than $0.20 from the strategy trigger.
-- Expire an unfilled pending order after two complete M5 bars.
+- Expire an unfilled pending order after three complete M5 bars.
 - Never chase an expired or missed signal.
 
 ## 5. Structural stop and target
@@ -213,8 +261,10 @@ Market-close protection uses the symbol's MT5 trade-session table, which is logg
 
 - No new entry in the last 15 minutes of a daily session (`InpNoEntryMinutesBeforeDailyClose`), which covers the rollover spread spike.
 - No new entry in the last 60 minutes before the weekly close (`InpNoEntryMinutesBeforeWeeklyClose`), which reduces the chance of holding a new position through the weekend gap. A stop loss does not protect against a gap; the fill happens at the reopening price.
-- The EA's pending orders are cancelled inside these windows. Open positions keep their SL/TP and are not closed.
+- The EA's pending orders are cancelled inside these windows.
+- Every EA position is closed at market 15 minutes before the weekly close (`InpCloseMinutesBeforeWeeklyClose`), so no position is held through the weekend gap. The no-entry window before the weekly close is never shorter than this.
 - If the session table is empty, the EA assumes the session ends at server midnight and the week ends on Friday.
+- The session table is the standard weekly schedule. Holiday early closes (for example 21:30 server time on some US holidays) are not in it, so on such a Friday the weekend close can happen before the EA closes its positions.
 
 Legacy options: `SESSION_UTC_WINDOW` (v1.1: 07:00–18:00 UTC) and `SESSION_LONDON_NY` (v1.0: 08:00–12:00 Europe/London and 08:00–12:00 America/New_York local time, DST-aware).
 
@@ -261,7 +311,7 @@ Before order submission:
 - Entry, SL, and TP must satisfy tick-size and broker stop-level constraints.
 - The EA must be attached to an XAU symbol and, in strict mode, a GBP account.
 
-The 120% margin gate is a minimum operational guard, not a statement that this margin utilization is conservative. At UK retail leverage of 1:20, 0.02 lot can consume a material part of a £400 account's free margin; the actual MT5 margin preview is authoritative.
+The 120% margin gate is a minimum operational guard, not a statement that this margin utilization is conservative. At UK retail leverage of 1:20, one 0.02-lot gold position needs about £300–£350 margin at $4,000–$4,650 gold, most of a £400 account. A second position needs about double; with the 120% gate that means roughly £740–£840 of equity. The EA logs the live margin per position and the equity needed for the configured number of positions on the first tick. The live MT5 margin figure is authoritative, and a Strategy Tester run must use the same leverage as the live account for its second-position results to be meaningful.
 
 ## 8. Daily accounting and hard halt
 
@@ -272,28 +322,37 @@ Daily statistics include only this EA's magic number and chart symbol.
 - Loss count: completed positions whose aggregate net result is negative.
 - Daily net P/L: aggregate profit, commission, and swap for all strategy deals since trade-server midnight.
 
-No new order is allowed when any condition is reached:
+No new order is allowed for the rest of the server day when either condition is reached:
 
-- ten entries;
-- two consecutive losing positions (default; `InpDailyLossCountMode=LOSS_COUNT_TOTAL` restores two losses in total); or
+- ten entries; or
 - net daily P/L at or below -£14.
 
-The consecutive-loss halt is sticky: once the streak is reached, the day stays halted even though no further trade can break it.
+Two consecutive losing positions start a cooldown (`InpCooldownHoursAfterHalt`, default 2 hours) measured from the exit of the second loss. During the cooldown, no new order is placed and the EA's pending order is cancelled; open positions keep their SL/TP. When it ends, the streak count restarts from zero, so another two consecutive losses start another cooldown. The loss order follows the exit time of each position, which matters when two positions are open together. Daily counters reset at server midnight, which also ends any running cooldown.
+
+With `InpCooldownHoursAfterHalt=0`, two consecutive losses halt the EA for the rest of the day (v1.2). `InpDailyLossCountMode=LOSS_COUNT_TOTAL` restores the v1.0 rule of two losses in total, which always halts for the day.
+
+A position closed early by the stale-trade rule or the weekend close counts like any other: a net loss extends the streak.
+
+Worst-case day: the -£14 limit is checked before new entries, not during a trade. With one position, the day can end about one full loss beyond it (about -£24). The worst-case check keeps an additional position from being opened when both stops together would cross the limit.
 
 There is no daily profit target and no recovery sizing.
 
 ## 9. Position management
 
-Version 1 uses deterministic broker-side SL/TP exits only:
+Exits are broker-side SL/TP, plus two EA actions:
+
+- **Weekend close:** every EA position is closed at market 15 minutes before the weekly close.
+- **Stale-trade release:** a position still open 36 M5 bars (3 hours) after its fill has its stop moved to entry + $0.10 (breakeven after costs) when the price is far enough in profit for the broker to accept that stop; otherwise it is closed at market (`InpStaleTradeAction`; `STALE_CLOSE` always closes, `STALE_BREAKEVEN_ONLY` only moves the stop). The rule acts once per position.
+
+Everything else is unchanged:
 
 - No trailing stop.
-- No automatic break-even move.
 - No widening or removal of SL.
-- No averaging, grid, martingale, or concurrent position.
+- No averaging, grid, martingale, or recovery sizing; an additional position (4.1a) is a separate setup with its own stop and the same fixed 0.02 lot.
 - No indicator-driven panic exit.
-- Session closure, a news window, or a daily halt does not close an already protected position.
+- A news window, a daily halt or a cooldown does not close an already protected position.
 
-This keeps the first backtest attributable to the defined entry, SL, and TP rather than discretionary exit logic.
+The end-of-run report splits exits into take profit, stop loss (including breakeven stops), EA-closed and other, so the effect of these two actions can be measured.
 
 ## 10. Validation gates before live use
 
@@ -305,6 +364,7 @@ This keeps the first backtest attributable to the defined entry, SL, and TP rath
 6. Run on a Pepperstone demo account for at least several weeks.
 7. Confirm actual average spread, slippage, fill rejection rate, trade frequency, net expectancy, loss streak, margin utilization, and maximum drawdown.
 8. Treat four to five trades per day as a target, not a quota. Zero trades is correct when no valid setup occurs.
-9. Read the end-of-run journal report. It lists the setup funnel (how many qualified setups each gate blocked) and closed-trade results by tier and by UTC session. Judge Tier 1, Tier 2 and each session separately; the Asian hours are new in v1.2.
+9. Read the end-of-run journal report. It lists the setup funnel (how many qualified setups each gate blocked), position-management counts, and closed-trade results by tier, UTC session, additional position, exit type and holding time. Judge Tier 1, Tier 2, each session and the additional positions separately.
+10. Run the Strategy Tester at the live account's leverage (1:20 for UK retail gold). A higher tester leverage lets the second position through the margin gate, which the live account cannot do.
 
 Live deployment is not approved by this specification. It requires explicit review of test evidence and acceptance of leveraged-CFD risk.
