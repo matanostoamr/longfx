@@ -1,6 +1,36 @@
-# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.3
+# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.4
 
 ## 0. Change log
+
+### v1.4 (from v1.3)
+
+| Area | v1.3 | v1.4 default |
+|---|---|---|
+| Spread filter | Skip when spread > $0.30 | Skip when spread > $0.60 (still blocks rollover/news spikes) |
+| Flat M15 regime | No setups | Range mode: when there is no M15 trend and \|EMA50 − EMA200\| ≤ 1.0 × M15 ATR14, fade the 1.5 ATR M5 band back toward EMA20 with RSI(2) ≤ 10 / ≥ 90 (`InpEnableRangeMode`) |
+| Reporting | — | Current regime on the dashboard; range setups in the funnel; results by setup type (T1, T2, Range) and for entries made after a cooldown the same day (`-C` in the order comment) |
+| Magic number | 26092813 | 26092814 |
+
+v1.3 behaviour: `InpMaximumSpreadPrice=0.30`, `InpEnableRangeMode=false`.
+
+#### v1.4 calibration evidence (approximate)
+
+Same replica as below, now also run on 28 Mar – 28 Jun 2026 (the out-of-sample quarter). Spread modelled as $0.40 in Asian hours (21:00–07:00 UTC) and $0.13 otherwise, per the user's observation of Pepperstone Asian spreads.
+
+With that spread model, v1.3's $0.30 filter blocked about 200 setups per quarter, more than any other rule, and removed every Asian trade. That brings the replica's v1.3 count to 2.3 trades/day, closer to the MT5 runs (1.66 and 1.38/day) than the earlier constant-spread replica (3.5/day).
+
+| Replica run (trades/day, net GBP) | Jun–Sep | Mar–Jun |
+|---|---:|---:|
+| v1.3 ($0.30 filter) | 2.32, −167 | 2.31, +144 |
+| + $0.60 filter | 3.25, −173 | 3.46, +93 |
+| + $0.60 + range mode (v1.4 defaults) | 3.62, −55 | 3.66, +93 |
+| + $0.60 + option B: M5 EMA20/50 fallback | 3.85, −215 | 3.74, −84 |
+| + $0.60 + option C: no M15 slope requirement | 4.37, −220 | 4.22, +60 |
+
+Range trades alone: 32 trades, 56% wins, +£77 (Jun–Sep); 18 trades, 50% wins, £0 (Mar–Jun). A looser flatness test (2.0 × ATR) or RSI 15/85 added trades and did slightly worse. The M5-alignment fallback's own trades lost £65 and £164; the relaxed-slope fallback's lost £76 and £41. Neither was built.
+
+Six-month replica total for v1.4 defaults: +£38 over 473 trades. The replica ranked the two quarters the opposite way to the MT5 runs, so neither result is evidence of an edge. At this trade count, one quarter's result varies by about ±£100–£150 from chance alone.
+
 
 ### v1.3 (from v1.2)
 
@@ -72,7 +102,7 @@ In the v1.2 replica, the daily loss breaker blocked the most setups (151), follo
 
 ## 1. Status and calibration boundary
 
-This document locks the fourth implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
+This document locks the fifth implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
 
 Pepperstone UK currently advertises Razor XAU/USD spreads from 0.08, GBP commission of £4.50 per lot round-trip, and retail gold leverage of 1:20. At 0.02 lot, the advertised commission implies £0.09 round-trip before spread and slippage. The EA reads the actual MT5 symbol properties at runtime and does not assume a particular number of digits, tick size, contract size, minimum stop level, or margin requirement.
 
@@ -175,7 +205,7 @@ Tier 1 (shallow pullback) — evaluated only when Tier 2 does not qualify:
 - Exhaustion RSI(2) ≤ 35.
 - Confirmation closes back above its EMA20 basis (`InpTier1RequireBasisReclaim`).
 
-Place a buy-stop at the confirmation high plus $0.05. Both tiers use identical sizing, SL, and TP rules; the order comment records the tier and UTC session (e.g. `AegisGold-v1.3-T1-ASIA`; sessions ASIA 21–07, LON 07–12, NY 12–17, LATE 17–21 UTC), plus `-P2` when the order is an additional position, so results can be split per tier, session and position slot.
+Place a buy-stop at the confirmation high plus $0.05. Both tiers use identical sizing, SL, and TP rules; the order comment records the setup type and UTC session (e.g. `AegisGold-v1.4-T1-ASIA`; sessions ASIA 21–07, LON 07–12, NY 12–17, LATE 17–21 UTC), plus `-P2` when the order is an additional position and `-C` when it was placed after a cooldown the same day, so results can be split per setup, session, position slot and cooldown.
 
 ### 4.1a Additional position
 
@@ -192,6 +222,15 @@ The additional position has its own structural SL and TP, calculated exactly as 
 ### 4.2 Short setup
 
 Exact mirror: M15 short regime; bearish confirmation closing at or below its midpoint and below the exhaustion close; Tier 2 needs the exhaustion high at or above `EMA20 + 1.2 × ATR20` with RSI(2) ≥ 85 and a confirmation close back below that band; Tier 1 needs the exhaustion high at or above EMA20 with RSI(2) ≥ 65 and a confirmation close back below EMA20. Place a sell-stop at the confirmation low minus $0.05.
+
+### 4.2a Range setup (flat M15 regime)
+
+Range mode applies only when neither M15 trend regime (3.1) is valid and `|EMA50 − EMA200| ≤ 1.0 × ATR14` on the last completed M15 bar. In that state, Tier 1 and Tier 2 are not used, and the EA looks for band fades in either direction:
+
+- Long: exhaustion low at or below `EMA20 − 1.5 × ATR20`; exhaustion RSI(2) ≤ 10; bullish confirmation that closes at or above its midpoint, above the exhaustion close, and back above its own 1.5 ATR lower band; confirmation true range ≤ 1.5 × ATR20.
+- Short: exact mirror at the upper band with RSI(2) ≥ 90.
+
+Entry, stop, target, expiry and every filter are the same as for trend setups. The order comment tag is `R` (e.g. `AegisGold-v1.4-R-ASIA`). When the M15 EMAs are neither trending nor within the flatness threshold (for example EMA50 above EMA200 but falling), no setup is taken; the dashboard shows this as "M15 mixed".
 
 ### 4.3 Pending-order handling
 
@@ -274,7 +313,9 @@ In the Strategy Tester, UTC (used for legacy windows and session tags) is derive
 
 ### 7.1 Spread
 
-Skip when `ask - bid > $0.30` in XAU/USD price units. Using a price-distance threshold avoids ambiguity between two-digit and three-digit broker quotes. The threshold is configurable for later tick-data calibration.
+Skip when `ask - bid > $0.60` in XAU/USD price units (v1.3 and earlier: $0.30). Using a price-distance threshold avoids ambiguity between two-digit and three-digit broker quotes.
+
+The spread is paid on every trade: at 0.02 lot, each $0.10 of spread costs about £0.15 per trade. A $0.45 Asian spread costs about £0.50 more per trade than a $0.12 London spread. The filter is kept, not removed, because rollover and news spreads can reach $1–$3, and a stop order placed into such a spike can fill far from the setup.
 
 ### 7.2 High-impact USD news
 
@@ -364,7 +405,7 @@ The end-of-run report splits exits into take profit, stop loss (including breake
 6. Run on a Pepperstone demo account for at least several weeks.
 7. Confirm actual average spread, slippage, fill rejection rate, trade frequency, net expectancy, loss streak, margin utilization, and maximum drawdown.
 8. Treat four to five trades per day as a target, not a quota. Zero trades is correct when no valid setup occurs.
-9. Read the end-of-run journal report. It lists the setup funnel (how many qualified setups each gate blocked), position-management counts, and closed-trade results by tier, UTC session, additional position, exit type and holding time. Judge Tier 1, Tier 2, each session and the additional positions separately.
+9. Read the end-of-run journal report. It lists the setup funnel (how many qualified setups each gate blocked), position-management counts, and closed-trade results by setup type (T1, T2, Range), UTC session, entries after a cooldown, additional position, exit type and holding time. Judge each of these separately.
 10. Run the Strategy Tester at the live account's leverage (1:20 for UK retail gold). A higher tester leverage lets the second position through the margin gate, which the live account cannot do.
 
 Live deployment is not approved by this specification. It requires explicit review of test evidence and acceptance of leveraged-CFD risk.
