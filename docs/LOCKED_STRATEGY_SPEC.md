@@ -1,8 +1,23 @@
-# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.0
+# Aegis Gold Trend-Pullback EA — Locked Strategy Specification v1.1
+
+## 0. v1.1 change log (from v1.0)
+
+| Area | v1.0 | v1.1 default |
+|---|---|---|
+| Entry window | 08:00–12:00 London local + 08:00–12:00 New York local | 07:00–18:00 UTC (v1.0 windows still selectable) |
+| Pullback trigger | Single tier: 1.5 ATR band touch + RSI(2) ≤ 10 / ≥ 90 | Tier 2: 1.2 ATR band + RSI(2) ≤ 15 / ≥ 85; Tier 1: EMA20 basis + RSI(2) ≤ 30 / ≥ 70 |
+| Max SL | Fixed $5.00 | `clamp(1.5 × M15 ATR14, $5.00, $7.00)` |
+| TP cap | $6.50 | $9.80 (keeps 1.4R up to a $7.00 stop) |
+| Loss halt | Two losing positions in total | Two **consecutive** losing positions (total mode selectable) |
+| Magic number | 26092801 | 26092811 (keeps v1.0 and v1.1 statistics separate) |
+
+v1.0 behaviour is reproducible with: `InpUseUtcSessionWindow=false`, `InpEnableTier1=false`, `InpKeltnerAtrMultiplier=1.5`, `InpTier2RsiLongThreshold=10`, `InpTier2RsiShortThreshold=90`, `InpUseAdaptiveMaxStop=false`, `InpMaximumTargetPrice=6.5`, `InpDailyLossCountMode=LOSS_COUNT_TOTAL`.
+
+The v1.0 3-month result (9 trades, PF 2.69) does not validate the v1.1 triggers: Tier 1 and the wider stop add trades that v1.0 never took. v1.1 must be re-tested from scratch.
 
 ## 1. Status and calibration boundary
 
-This document locks the first implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
+This document locks the second implementation candidate for MT5. The values below are execution-aware defaults, not a claim of statistical optimization. No Pepperstone XAU/USD tick dataset is available in this workspace, so profitability, expected frequency, and win rate remain unverified until real-tick backtesting and demo forward testing are complete.
 
 Pepperstone UK currently advertises Razor XAU/USD spreads from 0.08, GBP commission of £4.50 per lot round-trip, and retail gold leverage of 1:20. At 0.02 lot, the advertised commission implies £0.09 round-trip before spread and slippage. The EA reads the actual MT5 symbol properties at runtime and does not assume a particular number of digits, tick size, contract size, minimum stop level, or margin requirement.
 
@@ -27,10 +42,10 @@ Content sourced from external documentation has been rephrased for licensing com
 | Concurrent exposure | One position or pending entry on the symbol |
 | Entry timeframe | M5, evaluated once per newly opened M5 bar using closed candles only |
 | Regime timeframe | M15, using closed candles only |
-| Initial SL distance | $4.00 minimum; $5.00 maximum in XAU/USD price units |
-| TP distance | `clamp(1.4 × actual SL distance, $6.00, $6.50)` |
+| Initial SL distance | $4.00 minimum; adaptive maximum `clamp(1.5 × M15 ATR14, $5.00, $7.00)` in XAU/USD price units |
+| TP distance | `clamp(1.4 × actual SL distance, $6.00, $9.80)` |
 | Daily entry cap | Five filled entries per MT5 trade-server calendar day |
-| Daily hard halt | Two losing completed positions or net strategy P/L at or below -£14 |
+| Daily hard halt | Two consecutive losing completed positions or net strategy P/L at or below -£14 |
 | Position sizing escalation | Prohibited |
 
 A daily halt cancels the EA's unfilled pending entry and prevents new entries until the next trade-server day. It does not force-close a protected open position.
@@ -58,9 +73,10 @@ A flat or conflicting regime produces no entry.
 
 - Basis: EMA 20 of close
 - Volatility: ATR 20
-- Band multiplier: 1.5
-- Upper band: `EMA20 + 1.5 × ATR20`
-- Lower band: `EMA20 - 1.5 × ATR20`
+- Band multiplier: 1.2
+- Upper band: `EMA20 + 1.2 × ATR20`
+- Lower band: `EMA20 - 1.2 × ATR20`
+- Middle line (basis): `EMA20`
 
 The Keltner Channel is calculated inside the EA from native MT5 EMA and ATR buffers.
 
@@ -68,8 +84,8 @@ The Keltner Channel is calculated inside the EA from native MT5 EMA and ATR buff
 
 - RSI period: 2
 - Applied price: close
-- Long exhaustion threshold: RSI at or below 10
-- Short exhaustion threshold: RSI at or above 90
+- Tier 2 (deep) thresholds: RSI ≤ 15 for longs, ≥ 85 for shorts
+- Tier 1 (shallow) thresholds: RSI ≤ 30 for longs, ≥ 70 for shorts
 
 RSI is a timing condition, not a standalone entry.
 
@@ -82,35 +98,32 @@ At the first tick of a new M5 candle:
 
 ### 4.1 Long setup
 
-All conditions must be true:
+Common conditions (both tiers):
 
 1. M15 long regime is valid.
-2. Exhaustion candle low touches or penetrates its lower Keltner band.
-3. Exhaustion candle RSI(2) is at or below 10.
-4. Confirmation candle closes back above its lower Keltner band.
-5. Confirmation candle is bullish (`close > open`).
-6. Confirmation candle closes at or above the midpoint of its range.
-7. Confirmation close is above the exhaustion close.
-8. Confirmation true range is no greater than 1.5 × its ATR20.
-9. A valid structural stop and all execution/risk filters are available.
+2. Confirmation candle is bullish (`close > open`).
+3. Confirmation candle closes at or above the midpoint of its range.
+4. Confirmation close is above the exhaustion close.
+5. Confirmation true range is no greater than 1.5 × its ATR20.
+6. A valid structural stop and all execution/risk filters are available.
 
-Place a buy-stop at the confirmation high plus $0.05.
+Tier 2 (deep pullback) — evaluated first:
+
+- Exhaustion low touches or penetrates its lower band (`EMA20 − 1.2 × ATR20`).
+- Exhaustion RSI(2) ≤ 15.
+- Confirmation closes back above its lower band.
+
+Tier 1 (shallow pullback) — evaluated only when Tier 2 does not qualify:
+
+- Exhaustion low touches or penetrates its EMA20 basis.
+- Exhaustion RSI(2) ≤ 30.
+- Confirmation closes back above its EMA20 basis (`InpTier1RequireBasisReclaim`).
+
+Place a buy-stop at the confirmation high plus $0.05. Both tiers use identical sizing, SL, and TP rules; the order comment records the tier (`AegisGold-v1.1-T1` / `-T2`) so results can be split per tier.
 
 ### 4.2 Short setup
 
-All long conditions are mirrored:
-
-1. M15 short regime.
-2. Exhaustion high touches or penetrates the upper Keltner band.
-3. RSI(2) at or above 90.
-4. Confirmation closes back below the upper band.
-5. Bearish confirmation candle.
-6. Close at or below its range midpoint.
-7. Confirmation close below exhaustion close.
-8. Confirmation true range no greater than 1.5 × ATR20.
-9. Valid structure and filters.
-
-Place a sell-stop at the confirmation low minus $0.05.
+Exact mirror: M15 short regime; bearish confirmation closing at or below its midpoint and below the exhaustion close; Tier 2 needs the exhaustion high at or above `EMA20 + 1.2 × ATR20` with RSI(2) ≥ 85 and a confirmation close back below that band; Tier 1 needs the exhaustion high at or above EMA20 with RSI(2) ≥ 70 and a confirmation close back below EMA20. Place a sell-stop at the confirmation low minus $0.05.
 
 ### 4.3 Pending-order handling
 
@@ -136,18 +149,24 @@ For a short, it is the most recent swing high plus `0.15 × ATR20`.
 
 Let structural distance be the absolute entry-to-structural-candidate distance:
 
-- If structural distance exceeds $5.00, reject the setup.
+Maximum stop for the setup:
+
+```text
+max SL = clamp(1.5 × ATR14(M15, last completed bar), $5.00, $7.00)
+```
+
+- If structural distance exceeds max SL, reject the setup.
 - If structural distance is below $4.00, extend the SL distance to $4.00.
 - Otherwise, use the structural distance.
 
-The resulting SL therefore remains beyond the detected structure and within $4.00–$5.00.
+The resulting SL remains beyond the detected structure and within $4.00–$7.00. Set `InpUseAdaptiveMaxStop=false` to restore the fixed $5.00 ceiling.
 
 ### 5.3 TP normalization
 
 Calculate:
 
 ```text
-TP distance = clamp(1.4 × SL distance, $6.00, $6.50)
+TP distance = clamp(1.4 × SL distance, $6.00, $9.80)
 ```
 
 This produces:
@@ -156,18 +175,21 @@ This produces:
 |---:|---:|---:|
 | $4.00 | $6.00 | 1.50R |
 | $4.50 | $6.30 | 1.40R |
-| $5.00 | $6.50 | 1.30R |
+| $5.00 | $7.00 | 1.40R |
+| $6.00 | $8.40 | 1.40R |
+| $7.00 | $9.80 | 1.40R |
+
+At 0.02 lot on a 100 oz contract, a $7.00 stop is about $14 (≈ £10–£11 at current GBP/USD) before costs—above the v1.0 £7 per-trade loss range. Check the logged contract size. Because the halt is checked before each new entry, not during a trade, the worst day is roughly the -£14 threshold plus one more full loss (about -£24), not -£14.
 
 SL and TP are broker-side price levels. GBP results vary with the XAU/USD contract specification, GBP/USD conversion, spread, commission, and fill price. The EA does not close based on an exact GBP floating-profit value.
 
 ## 6. Trading windows
 
-New entries are allowed only during either window:
+Default (`InpUseUtcSessionWindow=true`): new entries are allowed from 07:00 to 18:00 UTC, Monday–Friday.
 
-- London: 08:00–12:00 Europe/London local time
-- New York: 08:00–12:00 America/New_York local time
+Legacy option (`InpUseUtcSessionWindow=false`): the v1.0 windows of 08:00–12:00 Europe/London and 08:00–12:00 America/New_York local time, with UK and US daylight-saving conversion.
 
-The EA converts from GMT and applies the current UK and US daylight-saving rules. Existing positions remain protected and active outside entry windows.
+In the Strategy Tester, UTC is derived from the Pepperstone server offset (GMT+2 / GMT+3 following US DST). Existing positions remain protected and active outside entry windows.
 
 No entry is permitted on Saturday or Sunday.
 
@@ -226,8 +248,10 @@ Daily statistics include only this EA's magic number and chart symbol.
 No new order is allowed when any condition is reached:
 
 - five entries;
-- two losing positions; or
+- two consecutive losing positions (default; `InpDailyLossCountMode=LOSS_COUNT_TOTAL` restores two losses in total); or
 - net daily P/L at or below -£14.
+
+The consecutive-loss halt is sticky: once the streak is reached, the day stays halted even though no further trade can break it.
 
 There is no daily profit target and no recovery sizing.
 

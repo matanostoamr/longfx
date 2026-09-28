@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.00"
-#property description "Aegis XAU/USD M15 regime and M5 Keltner-RSI pullback EA"
+#property version   "1.10"
+#property description "Aegis XAU/USD M15 regime and M5 two-tier Keltner-RSI pullback EA (v1.1 active)"
 
 #include <Trade/Trade.mqh>
 
@@ -13,23 +13,40 @@ enum SignalDirection
    SIGNAL_LONG  = 1
 };
 
+enum DailyLossCountMode
+{
+   LOSS_COUNT_CONSECUTIVE = 0, // Halt after N consecutive losing positions
+   LOSS_COUNT_TOTAL       = 1  // Halt after N losing positions in total (v1.0 behaviour)
+};
+
 input group "Identity and account safety"
-input ulong  InpMagicNumber                  = 26092801;
+input ulong  InpMagicNumber                  = 26092811;
 input bool   InpRequireGBPAccount             = true;
 input double InpFixedLots                     = 0.02;
 input double InpMinimumProjectedMarginLevel   = 120.0;
 
-input group "Trend and pullback"
+input group "Trend regime (M15)"
 input int    InpM15FastEmaPeriod              = 50;
 input int    InpM15SlowEmaPeriod              = 200;
 input int    InpM15SlopeLookbackBars          = 2;
+
+input group "Keltner / RSI (M5)"
 input int    InpM5KeltnerEmaPeriod            = 20;
 input int    InpM5AtrPeriod                   = 20;
-input double InpKeltnerAtrMultiplier          = 1.50;
 input int    InpRsiPeriod                     = 2;
-input double InpRsiLongThreshold              = 10.0;
-input double InpRsiShortThreshold             = 90.0;
 input double InpMaxConfirmationRangeAtr       = 1.50;
+
+input group "Tier 1: shallow pullback to Keltner middle (EMA20)"
+input bool   InpEnableTier1                   = true;
+input double InpTier1RsiLongThreshold         = 30.0;
+input double InpTier1RsiShortThreshold        = 70.0;
+input bool   InpTier1RequireBasisReclaim      = true;
+
+input group "Tier 2: deep pullback to outer Keltner band"
+input bool   InpEnableTier2                   = true;
+input double InpKeltnerAtrMultiplier          = 1.20;
+input double InpTier2RsiLongThreshold         = 15.0;
+input double InpTier2RsiShortThreshold        = 85.0;
 
 input group "Entry, stop and target"
 input double InpEntryBufferPrice              = 0.05;
@@ -38,13 +55,20 @@ input int    InpPendingExpiryBars             = 2;
 input int    InpSwingLookbackBars             = 12;
 input double InpSwingAtrBuffer                = 0.15;
 input double InpMinimumStopPrice              = 4.00;
-input double InpMaximumStopPrice              = 5.00;
+input bool   InpUseAdaptiveMaxStop            = true;
+input int    InpM15AtrPeriod                  = 14;
+input double InpAdaptiveStopM15AtrMultiple    = 1.50;
+input double InpMaximumStopPrice              = 5.00;  // Fixed max stop, and floor of the adaptive max
+input double InpAbsoluteMaximumStopPrice      = 7.00;  // Hard ceiling of the adaptive max
 input double InpRewardMultiple                = 1.40;
 input double InpMinimumTargetPrice            = 6.00;
-input double InpMaximumTargetPrice            = 6.50;
+input double InpMaximumTargetPrice            = 9.80;  // 1.4 x $7.00 keeps 1.4R at the widest stop
 input int    InpMaximumDeviationPoints        = 20;
 
 input group "Sessions"
+input bool   InpUseUtcSessionWindow           = true;  // true: single UTC window; false: v1.0 London/NY local windows
+input int    InpUtcSessionStartHour           = 7;
+input int    InpUtcSessionEndHour             = 18;
 input int    InpLondonStartHour               = 8;
 input int    InpLondonEndHour                 = 12;
 input int    InpNewYorkStartHour              = 8;
@@ -68,6 +92,7 @@ input double InpRunawayBodyAtr                = 0.80;
 input group "Daily controls (account currency)"
 input int    InpMaximumDailyEntries           = 5;
 input int    InpMaximumDailyLosses            = 2;
+input DailyLossCountMode InpDailyLossCountMode = LOSS_COUNT_CONSECUTIVE;
 input double InpMaximumDailyDrawdown          = 14.0;
 
 int      g_m5EmaHandle       = INVALID_HANDLE;
@@ -75,10 +100,13 @@ int      g_m5AtrHandle       = INVALID_HANDLE;
 int      g_m5RsiHandle       = INVALID_HANDLE;
 int      g_m15FastEmaHandle  = INVALID_HANDLE;
 int      g_m15SlowEmaHandle  = INVALID_HANDLE;
+int      g_m15AtrHandle      = INVALID_HANDLE;
 datetime g_lastM5BarTime     = 0;
 datetime g_dailyStart        = 0;
 int      g_dailyEntries      = 0;
-int      g_dailyLosses       = 0;
+int      g_dailyLosses       = 0;     // total losing positions today
+int      g_dailyConsecLosses = 0;     // current consecutive losing streak today
+int      g_lastSignalTier    = 0;
 double   g_dailyNet          = 0.0;
 bool     g_dailyHalted       = false;
 string   g_status            = "Initializing";
@@ -126,10 +154,11 @@ int OnInit()
    g_m5RsiHandle      = iRSI(_Symbol, PERIOD_M5, InpRsiPeriod, PRICE_CLOSE);
    g_m15FastEmaHandle = iMA(_Symbol, PERIOD_M15, InpM15FastEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    g_m15SlowEmaHandle = iMA(_Symbol, PERIOD_M15, InpM15SlowEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_m15AtrHandle     = iATR(_Symbol, PERIOD_M15, InpM15AtrPeriod);
 
    if(g_m5EmaHandle == INVALID_HANDLE || g_m5AtrHandle == INVALID_HANDLE ||
       g_m5RsiHandle == INVALID_HANDLE || g_m15FastEmaHandle == INVALID_HANDLE ||
-      g_m15SlowEmaHandle == INVALID_HANDLE)
+      g_m15SlowEmaHandle == INVALID_HANDLE || g_m15AtrHandle == INVALID_HANDLE)
    {
       PrintFormat("Initialization failed: unable to create indicator handles. Error %d.", GetLastError());
       ReleaseIndicators();
@@ -203,14 +232,22 @@ bool InputsAreValid()
       InpM15SlopeLookbackBars < 1)
       valid = false;
    if(InpM5KeltnerEmaPeriod <= 1 || InpM5AtrPeriod <= 1 || InpRsiPeriod <= 0 ||
-      InpKeltnerAtrMultiplier <= 0.0)
+      InpKeltnerAtrMultiplier <= 0.0 || InpM15AtrPeriod <= 1)
       valid = false;
-   if(InpRsiLongThreshold <= 0.0 || InpRsiLongThreshold >= 50.0 ||
-      InpRsiShortThreshold <= 50.0 || InpRsiShortThreshold >= 100.0)
+   if(!InpEnableTier1 && !InpEnableTier2)
+      valid = false;
+   if(InpTier1RsiLongThreshold <= 0.0 || InpTier1RsiLongThreshold >= 50.0 ||
+      InpTier1RsiShortThreshold <= 50.0 || InpTier1RsiShortThreshold >= 100.0 ||
+      InpTier2RsiLongThreshold <= 0.0 || InpTier2RsiLongThreshold >= 50.0 ||
+      InpTier2RsiShortThreshold <= 50.0 || InpTier2RsiShortThreshold >= 100.0)
       valid = false;
    if(InpMinimumStopPrice <= 0.0 || InpMaximumStopPrice < InpMinimumStopPrice ||
+      InpAbsoluteMaximumStopPrice < InpMaximumStopPrice || InpAdaptiveStopM15AtrMultiple <= 0.0 ||
       InpMinimumTargetPrice <= 0.0 || InpMaximumTargetPrice < InpMinimumTargetPrice ||
       InpRewardMultiple <= 0.0)
+      valid = false;
+   if(InpUtcSessionStartHour < 0 || InpUtcSessionStartHour > 23 || InpUtcSessionEndHour < 1 ||
+      InpUtcSessionEndHour > 24 || InpUtcSessionStartHour >= InpUtcSessionEndHour)
       valid = false;
    if(InpPendingExpiryBars < 1 || InpSwingLookbackBars < 3 || InpAtrMedianLookbackBars < 10 ||
       InpNormalBarsAfterShock < 1)
@@ -283,7 +320,9 @@ void EvaluateNewM5Bar()
 
    if(!IsEntrySession())
    {
-      SetStatus("Outside London/New York entry windows");
+      SetStatus(InpUseUtcSessionWindow
+                ? StringFormat("Outside %02d:00-%02d:00 UTC entry window", InpUtcSessionStartHour, InpUtcSessionEndHour)
+                : "Outside London/New York entry windows");
       return;
    }
 
@@ -307,7 +346,8 @@ void EvaluateNewM5Bar()
    double rsi[];
    double m15_fast[];
    double m15_slow[];
-   if(!LoadStrategyData(rates, ema, atr, rsi, m15_fast, m15_slow))
+   double m15_atr[];
+   if(!LoadStrategyData(rates, ema, atr, rsi, m15_fast, m15_slow, m15_atr))
    {
       SetStatus("Waiting for sufficient indicator history");
       return;
@@ -325,7 +365,8 @@ void EvaluateNewM5Bar()
       return;
    }
 
-   SignalDirection signal = BuildSignal(rates, ema, atr, rsi, m15_fast, m15_slow);
+   int tier = 0;
+   SignalDirection signal = BuildSignal(rates, ema, atr, rsi, m15_fast, m15_slow, tier);
    if(signal == SIGNAL_NONE)
    {
       SetStatus("No qualified closed-candle setup");
@@ -338,14 +379,26 @@ void EvaluateNewM5Bar()
       return;
    }
 
-   PlaceProtectedPendingOrder(signal, rates, atr, tick);
+   g_lastSignalTier = tier;
+   PlaceProtectedPendingOrder(signal, tier, rates, atr, CurrentMaximumStopPrice(m15_atr), tick);
+}
+
+//+------------------------------------------------------------------+
+//| Maximum structural stop: fixed, or adaptive to completed M15 ATR |
+//+------------------------------------------------------------------+
+double CurrentMaximumStopPrice(const double &m15_atr[])
+{
+   if(!InpUseAdaptiveMaxStop)
+      return InpMaximumStopPrice;
+   return Clamp(InpAdaptiveStopM15AtrMultiple * m15_atr[1],
+                InpMaximumStopPrice, InpAbsoluteMaximumStopPrice);
 }
 
 //+------------------------------------------------------------------+
 //| Load closed/current M5 and M15 values                             |
 //+------------------------------------------------------------------+
 bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &rsi[],
-                      double &m15_fast[], double &m15_slow[])
+                      double &m15_fast[], double &m15_slow[], double &m15_atr[])
 {
    int needed_m5 = InpAtrMedianLookbackBars + InpNormalBarsAfterShock + 10;
    if(needed_m5 < InpSwingLookbackBars + 5)
@@ -361,10 +414,11 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
    ArraySetAsSeries(rsi, true);
    ArraySetAsSeries(m15_fast, true);
    ArraySetAsSeries(m15_slow, true);
+   ArraySetAsSeries(m15_atr, true);
 
    if(BarsCalculated(g_m5EmaHandle) < needed_m5 || BarsCalculated(g_m5AtrHandle) < needed_m5 ||
       BarsCalculated(g_m5RsiHandle) < needed_m5 || BarsCalculated(g_m15FastEmaHandle) < needed_m15 ||
-      BarsCalculated(g_m15SlowEmaHandle) < needed_m15)
+      BarsCalculated(g_m15SlowEmaHandle) < needed_m15 || BarsCalculated(g_m15AtrHandle) < needed_m15)
       return false;
 
    if(CopyRates(_Symbol, PERIOD_M5, 0, needed_m5, rates) != needed_m5)
@@ -379,52 +433,98 @@ bool LoadStrategyData(MqlRates &rates[], double &ema[], double &atr[], double &r
       return false;
    if(CopyBuffer(g_m15SlowEmaHandle, 0, 0, needed_m15, m15_slow) != needed_m15)
       return false;
+   if(CopyBuffer(g_m15AtrHandle, 0, 0, needed_m15, m15_atr) != needed_m15)
+      return false;
 
-   return (atr[1] > 0.0 && atr[2] > 0.0);
+   return (atr[1] > 0.0 && atr[2] > 0.0 && m15_atr[1] > 0.0);
 }
 
 //+------------------------------------------------------------------+
-//| Build a direction from the locked closed-candle rules            |
+//| Build a direction and tier from closed-candle rules              |
+//| Tier 2 (deep): exhaustion bar reaches the outer band (1.2 ATR)   |
+//|                with RSI(2) <= 15 / >= 85.                        |
+//| Tier 1 (shallow): exhaustion bar reaches the EMA20 basis with    |
+//|                RSI(2) <= 30 / >= 70, and confirmation reclaims   |
+//|                the basis. Tier 2 is checked first.               |
 //+------------------------------------------------------------------+
 SignalDirection BuildSignal(const MqlRates &rates[], const double &ema[], const double &atr[],
-                            const double &rsi[], const double &m15_fast[], const double &m15_slow[])
+                            const double &rsi[], const double &m15_fast[], const double &m15_slow[],
+                            int &tier)
 {
+   tier = 0;
    int slope_shift = 1 + InpM15SlopeLookbackBars;
    bool long_regime  = (m15_fast[1] > m15_slow[1] && m15_fast[1] > m15_fast[slope_shift]);
    bool short_regime = (m15_fast[1] < m15_slow[1] && m15_fast[1] < m15_fast[slope_shift]);
+   if(!long_regime && !short_regime)
+      return SIGNAL_NONE;
 
-   double lower_exhaustion = ema[2] - InpKeltnerAtrMultiplier * atr[2];
-   double upper_exhaustion = ema[2] + InpKeltnerAtrMultiplier * atr[2];
-   double lower_confirm    = ema[1] - InpKeltnerAtrMultiplier * atr[1];
-   double upper_confirm    = ema[1] + InpKeltnerAtrMultiplier * atr[1];
-   double confirmation_range = TrueRange(rates, 1);
-
+   double confirmation_range    = TrueRange(rates, 1);
    double confirmation_midpoint = (rates[1].high + rates[1].low) * 0.5;
+   if(confirmation_range > InpMaxConfirmationRangeAtr * atr[1])
+      return SIGNAL_NONE;
 
-   bool normal_confirmation = (confirmation_range <= InpMaxConfirmationRangeAtr * atr[1]);
+   // Common confirmation-candle quality (direction, close location, momentum shift)
+   bool long_confirm  = rates[1].close > rates[1].open &&
+                        rates[1].close >= confirmation_midpoint && rates[1].close > rates[2].close;
+   bool short_confirm = rates[1].close < rates[1].open &&
+                        rates[1].close <= confirmation_midpoint && rates[1].close < rates[2].close;
 
-   bool long_setup = long_regime && normal_confirmation &&
-                     rates[2].low <= lower_exhaustion && rsi[2] <= InpRsiLongThreshold &&
-                     rates[1].close > lower_confirm && rates[1].close > rates[1].open &&
-                     rates[1].close >= confirmation_midpoint && rates[1].close > rates[2].close;
+   if(long_regime && long_confirm)
+   {
+      if(InpEnableTier2)
+      {
+         double lower_exhaustion = ema[2] - InpKeltnerAtrMultiplier * atr[2];
+         double lower_confirm    = ema[1] - InpKeltnerAtrMultiplier * atr[1];
+         if(rates[2].low <= lower_exhaustion && rsi[2] <= InpTier2RsiLongThreshold &&
+            rates[1].close > lower_confirm)
+         {
+            tier = 2;
+            return SIGNAL_LONG;
+         }
+      }
+      if(InpEnableTier1)
+      {
+         bool reclaim = !InpTier1RequireBasisReclaim || rates[1].close > ema[1];
+         if(rates[2].low <= ema[2] && rsi[2] <= InpTier1RsiLongThreshold && reclaim)
+         {
+            tier = 1;
+            return SIGNAL_LONG;
+         }
+      }
+   }
 
-   bool short_setup = short_regime && normal_confirmation &&
-                      rates[2].high >= upper_exhaustion && rsi[2] >= InpRsiShortThreshold &&
-                      rates[1].close < upper_confirm && rates[1].close < rates[1].open &&
-                      rates[1].close <= confirmation_midpoint && rates[1].close < rates[2].close;
+   if(short_regime && short_confirm)
+   {
+      if(InpEnableTier2)
+      {
+         double upper_exhaustion = ema[2] + InpKeltnerAtrMultiplier * atr[2];
+         double upper_confirm    = ema[1] + InpKeltnerAtrMultiplier * atr[1];
+         if(rates[2].high >= upper_exhaustion && rsi[2] >= InpTier2RsiShortThreshold &&
+            rates[1].close < upper_confirm)
+         {
+            tier = 2;
+            return SIGNAL_SHORT;
+         }
+      }
+      if(InpEnableTier1)
+      {
+         bool reclaim = !InpTier1RequireBasisReclaim || rates[1].close < ema[1];
+         if(rates[2].high >= ema[2] && rsi[2] >= InpTier1RsiShortThreshold && reclaim)
+         {
+            tier = 1;
+            return SIGNAL_SHORT;
+         }
+      }
+   }
 
-   if(long_setup && !short_setup)
-      return SIGNAL_LONG;
-   if(short_setup && !long_setup)
-      return SIGNAL_SHORT;
    return SIGNAL_NONE;
 }
 
 //+------------------------------------------------------------------+
 //| Place a broker-side protected stop entry                         |
 //+------------------------------------------------------------------+
-void PlaceProtectedPendingOrder(const SignalDirection signal, const MqlRates &rates[],
-                                const double &atr[], const MqlTick &tick)
+void PlaceProtectedPendingOrder(const SignalDirection signal, const int tier, const MqlRates &rates[],
+                                const double &atr[], const double maximum_stop, const MqlTick &tick)
 {
    ENUM_SYMBOL_TRADE_MODE trade_mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if((signal == SIGNAL_LONG && trade_mode == SYMBOL_TRADE_MODE_SHORTONLY) ||
@@ -491,10 +591,10 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const MqlRates &ra
       return;
    }
 
-   if(structural_distance > InpMaximumStopPrice + tick_size * 0.5)
+   if(structural_distance > maximum_stop + tick_size * 0.5)
    {
-      SetStatus(StringFormat("Structure needs %.2f stop; maximum is %.2f",
-                             structural_distance, InpMaximumStopPrice));
+      SetStatus(StringFormat("Structure needs %.2f stop; current maximum is %.2f",
+                             structural_distance, maximum_stop));
       return;
    }
 
@@ -506,7 +606,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const MqlRates &ra
       stop_loss = RoundUpToTick(entry + stop_distance);
 
    stop_distance = MathAbs(entry - stop_loss);
-   if(stop_distance > InpMaximumStopPrice + tick_size)
+   if(stop_distance > maximum_stop + tick_size)
    {
       SetStatus("Tick normalization pushed stop beyond maximum");
       return;
@@ -536,7 +636,7 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const MqlRates &ra
       expiration = iTime(_Symbol, PERIOD_M5, 0) + InpPendingExpiryBars * PeriodSeconds(PERIOD_M5);
    }
 
-   string comment = "AegisGold-v1";
+   string comment = StringFormat("AegisGold-v1.1-T%d", tier);
    bool request_ok = false;
    if(signal == SIGNAL_LONG)
       request_ok = Trade.BuyStop(InpFixedLots, entry, _Symbol, stop_loss, take_profit,
@@ -555,11 +655,12 @@ void PlaceProtectedPendingOrder(const SignalDirection signal, const MqlRates &ra
       return;
    }
 
-   SetStatus(StringFormat("%s stop placed: entry %.3f SL %.3f TP %.3f",
-                          signal == SIGNAL_LONG ? "Buy" : "Sell", entry, stop_loss, take_profit));
-   PrintFormat("Protected %s stop accepted. order=%I64u volume=%.2f entry=%.3f sl=%.3f tp=%.3f SLdist=%.3f TPdist=%.3f",
-               signal == SIGNAL_LONG ? "buy" : "sell", Trade.ResultOrder(), InpFixedLots,
-               entry, stop_loss, take_profit, MathAbs(entry - stop_loss), MathAbs(take_profit - entry));
+   SetStatus(StringFormat("Tier %d %s stop placed: entry %.3f SL %.3f TP %.3f",
+                          tier, signal == SIGNAL_LONG ? "buy" : "sell", entry, stop_loss, take_profit));
+   PrintFormat("Protected tier-%d %s stop accepted. order=%I64u volume=%.2f entry=%.3f sl=%.3f tp=%.3f SLdist=%.3f TPdist=%.3f maxSL=%.3f",
+               tier, signal == SIGNAL_LONG ? "buy" : "sell", Trade.ResultOrder(), InpFixedLots,
+               entry, stop_loss, take_profit, MathAbs(entry - stop_loss), MathAbs(take_profit - entry),
+               maximum_stop);
 }
 
 //+------------------------------------------------------------------+
@@ -739,6 +840,9 @@ bool IsEntrySession()
    if(utc_parts.day_of_week == 0 || utc_parts.day_of_week == 6)
       return false;
 
+   if(InpUseUtcSessionWindow)
+      return IsHourWindow(utc, InpUtcSessionStartHour, InpUtcSessionEndHour);
+
    int london_offset = IsUkDaylightSaving(utc) ? 1 : 0;
    int new_york_offset = IsUsDaylightSaving(utc) ? -4 : -5;
 
@@ -861,6 +965,7 @@ void RefreshDailyStats()
    g_dailyStart   = day_start;
    g_dailyEntries = 0;
    g_dailyLosses  = 0;
+   g_dailyConsecLosses = 0;
    g_dailyNet     = 0.0;
 
    if(!HistorySelect(day_start, now))
@@ -900,6 +1005,8 @@ void RefreshDailyStats()
       }
    }
 
+   int current_streak = 0;
+   int max_streak = 0;
    for(int position_index = 0; position_index < ArraySize(closed_position_ids); position_index++)
    {
       double position_net = 0.0;
@@ -918,13 +1025,33 @@ void RefreshDailyStats()
          if(entry_type == DEAL_ENTRY_OUT || entry_type == DEAL_ENTRY_OUT_BY || entry_type == DEAL_ENTRY_INOUT)
             has_exit = true;
       }
-      if(has_exit && position_net < 0.0)
+      // closed_position_ids is in chronological exit order (history deals are time-ordered
+      // and the EA holds one position at a time), so a running streak is well defined.
+      if(!has_exit)
+         continue;
+      if(position_net < 0.0)
+      {
          g_dailyLosses++;
+         current_streak++;
+         if(current_streak > max_streak)
+            max_streak = current_streak;
+      }
+      else
+         current_streak = 0;
    }
 
+   // Halt is sticky for the day: once N consecutive losses occurred, stop until next server day.
+   g_dailyConsecLosses = max_streak;
+   int counted_losses = (InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE) ? max_streak : g_dailyLosses;
+
    g_dailyHalted = (g_dailyEntries >= InpMaximumDailyEntries ||
-                    g_dailyLosses >= InpMaximumDailyLosses ||
+                    counted_losses >= InpMaximumDailyLosses ||
                     g_dailyNet <= -InpMaximumDailyDrawdown);
+}
+
+int CountedDailyLosses()
+{
+   return (InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE) ? g_dailyConsecLosses : g_dailyLosses;
 }
 
 double DealNetResult(const ulong deal_ticket)
@@ -955,8 +1082,9 @@ datetime StartOfDay(const datetime value)
 
 string DailyHaltDescription()
 {
-   if(g_dailyLosses >= InpMaximumDailyLosses)
-      return StringFormat("Daily halt: %d losses", g_dailyLosses);
+   if(CountedDailyLosses() >= InpMaximumDailyLosses)
+      return StringFormat("Daily halt: %d %s losses", CountedDailyLosses(),
+                          InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE ? "consecutive" : "total");
    if(g_dailyNet <= -InpMaximumDailyDrawdown)
       return StringFormat("Daily halt: net P/L %.2f", g_dailyNet);
    if(g_dailyEntries >= InpMaximumDailyEntries)
@@ -1113,9 +1241,11 @@ void ReleaseIndicators()
       IndicatorRelease(g_m15FastEmaHandle);
    if(g_m15SlowEmaHandle != INVALID_HANDLE)
       IndicatorRelease(g_m15SlowEmaHandle);
+   if(g_m15AtrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_m15AtrHandle);
 
    g_m5EmaHandle = g_m5AtrHandle = g_m5RsiHandle = INVALID_HANDLE;
-   g_m15FastEmaHandle = g_m15SlowEmaHandle = INVALID_HANDLE;
+   g_m15FastEmaHandle = g_m15SlowEmaHandle = g_m15AtrHandle = INVALID_HANDLE;
 }
 
 void SetStatus(const string status)
@@ -1135,15 +1265,16 @@ void UpdateDashboard()
       spread = tick.ask - tick.bid;
 
    string dashboard = StringFormat(
-      "Aegis Gold Trend-Pullback v1.00\n"
+      "Aegis Gold Trend-Pullback v1.10 (two-tier)\n"
       "Symbol: %s | Lots: %.2f | Spread: %.3f\n"
-      "Today: entries %d/%d | losses %d/%d | net %.2f %s\n"
-      "Halted: %s | Status: %s",
+      "Today: entries %d/%d | losses %d total, %d consecutive (halt at %d %s) | net %.2f %s\n"
+      "Last signal tier: %d | Halted: %s | Status: %s",
       _Symbol, InpFixedLots, spread,
       g_dailyEntries, InpMaximumDailyEntries,
-      g_dailyLosses, InpMaximumDailyLosses,
+      g_dailyLosses, g_dailyConsecLosses, InpMaximumDailyLosses,
+      InpDailyLossCountMode == LOSS_COUNT_CONSECUTIVE ? "consecutive" : "total",
       g_dailyNet, AccountInfoString(ACCOUNT_CURRENCY),
-      g_dailyHalted ? "YES" : "NO", g_status);
+      g_lastSignalTier, g_dailyHalted ? "YES" : "NO", g_status);
    Comment(dashboard);
 }
 
