@@ -10,14 +10,22 @@ A MetaTrader 5 Expert Advisor implementing a selective XAU/USD trend-pullback st
 aegis-gold-mt5/
 ├── README.md
 ├── docs/
-│   └── LOCKED_STRATEGY_SPEC.md
+│   ├── LOCKED_STRATEGY_SPEC.md
+│   └── INTRADAY_SPEC.md
 └── MQL5/
     └── Experts/
-        └── AegisGoldTrendPullback.mq5
+        ├── AegisGoldTrendPullback.mq5
+        └── AegisGoldIntraday.mq5
 ```
 
 - [`docs/LOCKED_STRATEGY_SPEC.md`](docs/LOCKED_STRATEGY_SPEC.md) is the authoritative rulebook.
 - [`MQL5/Experts/AegisGoldTrendPullback.mq5`](MQL5/Experts/AegisGoldTrendPullback.mq5) is the complete EA source.
+
+## Aegis Gold Intraday v2.0 (experiment)
+
+[`MQL5/Experts/AegisGoldIntraday.mq5`](MQL5/Experts/AegisGoldIntraday.mq5) is a separate, all-day intraday EA (magic 26092820). It does not change v1.5, which remains the locked build. It reads the M15 regime on every M5 bar and trades five setups (T0/T1/T2 in trends, R in flat markets, X in transitions) with a fixed $4 target / $3 stop, breakeven at +$1.50, one position at a time, a 6% daily loss stop and the v1.5 rocket-move shield. There is no daily trade cap and no cooldown.
+
+It is on probation: [`docs/INTRADAY_SPEC.md`](docs/INTRADAY_SPEC.md) sets out the rules, the pass/fail test agreed before testing, and the replica evidence (roughly break-even after costs).
 
 ## Locked defaults (v1.5)
 
