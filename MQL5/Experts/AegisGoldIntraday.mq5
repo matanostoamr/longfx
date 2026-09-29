@@ -1,5 +1,5 @@
 #property strict
-#property version   "2.00"
+#property version   "2.01"
 #property description "Aegis Gold Intraday v2.0 (experiment): all-day XAU/USD M5 engine, regime reader, $4/$3 bracket, breakeven"
 
 #include <Trade/Trade.mqh>
@@ -111,6 +111,8 @@ input int    InpMaximumDeviationPoints        = 20;
 input group "Sessions and market close"
 // false: no new entries 21:00-07:00 UTC
 input bool   InpTradeAsiaSession              = true;
+// false: no new entries 17:00-21:00 UTC (US afternoon into the daily rollover)
+input bool   InpTradeLateSession              = true;
 input bool   InpTesterUsesPepperstoneServer   = true;
 input int    InpFallbackServerUtcOffsetHours  = 2;
 input int    InpNoEntryMinutesBeforeDailyClose  = 15;
@@ -905,14 +907,19 @@ void RefreshDailyStats()
                     (InpMaxEntriesPerDay > 0 && g_dailyEntries >= InpMaxEntriesPerDay));
 }
 
-// 24/5 in server time; optionally skip the Asian session (21:00-07:00 UTC).
+// 24/5 in server time; optionally skip the Asian (21:00-07:00 UTC) and late (17:00-21:00 UTC) sessions.
 bool IsEntrySession()
 {
    MqlDateTime server_parts;
    TimeToStruct(ServerNow(), server_parts);
    if(server_parts.day_of_week == 0 || server_parts.day_of_week == 6)
       return false;
-   return (InpTradeAsiaSession || SessionTag() != "ASIA");
+   string session_tag = SessionTag();
+   if(!InpTradeAsiaSession && session_tag == "ASIA")
+      return false;
+   if(!InpTradeLateSession && session_tag == "LATE")
+      return false;
+   return true;
 }
 
 string SessionBlockDescription()
@@ -921,6 +928,8 @@ string SessionBlockDescription()
    TimeToStruct(ServerNow(), server_parts);
    if(server_parts.day_of_week == 0 || server_parts.day_of_week == 6)
       return "Weekend (server time)";
+   if(SessionTag() == "LATE")
+      return "Late session switched off (17:00-21:00 UTC)";
    return "Asian session switched off (21:00-07:00 UTC)";
 }
 
@@ -1087,15 +1096,16 @@ void UpdateDashboard()
    ScanSymbolExposure(own_positions, own_direction, foreign_exposure);
 
    string dashboard = StringFormat(
-      "Aegis Gold Intraday v2.00 (experiment)\n"
+      "Aegis Gold Intraday v2.01 (experiment)\n"
       "Symbol: %s | Lots: %.2f | Spread: %.3f (max %.2f) | EA positions: %d/%d\n"
       "Today: entries %d | net %.2f %s | daily loss stop -%.2f (%s)\n"
-      "Regime: %s | Last setup: %s | Asia session: %s\n"
+      "Regime: %s | Last setup: %s | Sessions: Asia %s, Late %s\n"
       "Status: %s",
       _Symbol, InpFixedLots, spread, InpMaximumSpreadPrice, own_positions, g_maxPositions,
       g_dailyEntries, g_dailyNet, AccountInfoString(ACCOUNT_CURRENCY), DailyLossLimit(),
       g_dailyHalted ? "reached" : "not reached",
       g_regimeText, g_lastSetup > 0 ? SetupTag(g_lastSetup) : "none", InpTradeAsiaSession ? "on" : "off",
+      InpTradeLateSession ? "on" : "off",
       g_status);
    Comment(dashboard);
 }

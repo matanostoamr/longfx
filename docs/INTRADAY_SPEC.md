@@ -16,11 +16,11 @@ In addition, combined net profit over the three periods must beat v1.5's combine
 
 Runs:
 
-1. Defaults, all three periods.
-2. Variant `InpEnableTier1=false`, `InpTradeAsiaSession=false`, all three periods.
-3. v1.5, 9 Feb – 28 Mar.
+1. **Candidate**, all three periods: `InpEnableTier1=false`, `InpEnableTransitionEngine=false`, `InpTradeAsiaSession=false`, `InpTradeLateSession=false` (needs v2.01), everything else at defaults. Fixed after the 10–29 Sep run (section 7) and before any three-period result.
+2. Defaults, all three periods (optional reference).
+3. v1.5, 9 Feb – 28 Mar, to complete the comparison.
 
-Either configuration can pass, but judge each against the rule above rather than picking whichever looks better in Jun–Sep.
+Only the candidate is judged; the defaults run is not a second chance. The X and LATE exclusions rest mainly on the 10–29 Sep run, which lies inside 28 Jun – 28 Sep, so 9 Feb – 28 Mar is the decisive period. No setting changes after any of these results.
 
 ## 2. Regime reader and setups
 
@@ -60,7 +60,7 @@ Trend setups are checked in the order T2, T1, T0.
 - High-impact USD news, 15 minutes either side.
 - No new entries in the last 15 minutes of a daily session or the last 60 minutes before the weekly close.
 
-Switches: `InpEnableTrendEngine`, `InpEnableTier0`, `InpEnableTier1`, `InpEnableTier2`, `InpEnableRangeEngine`, `InpEnableTransitionEngine`, and `InpTradeAsiaSession` (false = no new entries 21:00–07:00 UTC).
+Switches: `InpEnableTrendEngine`, `InpEnableTier0`, `InpEnableTier1`, `InpEnableTier2`, `InpEnableRangeEngine`, `InpEnableTransitionEngine`, `InpTradeAsiaSession` (false = no new entries 21:00–07:00 UTC) and `InpTradeLateSession` (false = no new entries 17:00–21:00 UTC, the hours into the daily rollover; added in v2.01).
 
 ## 5. Report
 
@@ -87,3 +87,30 @@ These defaults are the best of about 120 configurations in the offline replica (
 | 9 Feb – 28 Mar (untouched) | 11.4 | −£46 | 0.93 |
 
 Costs were about £0.58 per trade, or £6–7 per day. The result is within chance and very sensitive to spread and slippage, so expect roughly break-even. In the replica, Tier 2 and London were profitable in both tuned quarters; Tier 1 and the Asian session were weak or losing.
+
+## 7. Test log
+
+### 10–29 Sep 2026: defaults on Pepperstone (v2.00)
+
+| Trades | Net | PF | Max drawdown | Worst day |
+|---:|---:|---:|---:|---:|
+| 162 (≈ 11.6/day) | −£35.13 | 0.87 | £66.45 | −£29.34 |
+
+- Costs £75.13, about £0.46 per trade: commission £16.20, spread at entry £28.53, entry slippage £30.40. Net before these costs about +£40.
+- Exits: 41 take profit, 54 stop loss, 67 breakeven scratches.
+- Sessions: LON +£30.75, NY +£3.76, ASIA −£27.44, LATE −£42.20. Setups: T2 +£16.20, R +£5.80, T1 −£0.29, T0 −£21.01, X −£35.83.
+- The worst day went about £5 past the 6% stop (≈ £24). The stop allows $0.05 of slippage per trade, so one stop that slipped several dollars is the likely cause.
+
+The replica on nearly the same dates (10–27 Sep, where its data ends) made +£51 at these measured costs, about £85 better than Pepperstone. Its predictions below are therefore a best case.
+
+### Candidate (run 1): replica prediction, written before the Pepperstone runs
+
+Measured costs: $0.12 spread, $0.125 slippage on entries and stop exits.
+
+| Period | Trades/day | Net | PF |
+|---|---:|---:|---:|
+| 28 Jun – 28 Sep | 2.6 | +£56 | 1.21 |
+| 28 Mar – 28 Jun | 3.1 | +£87 | 1.26 |
+| 9 Feb – 28 Mar | 3.1 | +£11 | 1.06 |
+
+Even this best case totals about +£150, while v1.5 made +£564 on Pepperstone over the first two periods alone. The candidate is therefore unlikely to meet the "beat v1.5" condition even if it is positive in all three periods.
